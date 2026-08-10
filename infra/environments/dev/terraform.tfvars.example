@@ -1,0 +1,29 @@
+# Copy to terraform.tfvars and adjust as needed.
+# Every value below has a working default in variables.tf — override only what you need to change.
+
+region       = "us-east-1"
+project_name = "commerceops"
+environment  = "dev"
+
+azs                  = ["us-east-1a", "us-east-1b"]
+vpc_cidr             = "10.0.0.0/16"
+public_subnet_cidrs  = ["10.0.0.0/24", "10.0.1.0/24"]
+private_subnet_cidrs = ["10.0.10.0/24", "10.0.11.0/24"]
+
+container_port      = 8000
+db_port             = 5432
+db_name             = "commerceops"
+db_username         = "commerceops"
+rds_instance_class  = "db.t3.micro"
+
+ecs_cpu           = 256
+ecs_memory        = 512
+ecs_desired_count = 1
+
+# Must match the repo hosting this code, or the GitHub Actions OIDC trust policy
+# will reject the workflow's token.
+github_repo   = "thangduongvan/commerceops-ai-platform"
+github_branch = "main"
+
+# Optional: get an email when a CloudWatch alarm fires.
+alarm_email = ""

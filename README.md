@@ -1,8 +1,11 @@
-# CommerceOps AI Platform — V0: Local Modular Monolith
+# CommerceOps AI Platform
 
-V0 of the [CommerceOps AI Platform learning project](../Solution%20Architect%20Learning%20Project.md): a local, Docker-based FastAPI + PostgreSQL modular monolith covering the Customer, Product, Order, Payment, and Notification domains. No AWS yet — that starts at V1.
+The [CommerceOps AI Platform learning project](../Solution%20Architect%20Learning%20Project.md): a FastAPI + PostgreSQL modular monolith covering the Customer, Product, Order, Payment, and Notification domains, evolving version by version toward microservices, event-driven architecture, CQRS, Saga, and an AI Operations Agent.
 
-## Architecture
+* **V0 — Local Modular Monolith**: Docker Compose, no AWS. See below.
+* **V1 — AWS Foundation**: deploy the same app to ECS/Fargate behind an ALB, backed by RDS. See [Deploying to AWS (V1)](#deploying-to-aws-v1) below.
+
+## V0: Local architecture
 
 ```mermaid
 flowchart TD
@@ -41,7 +44,17 @@ tests/
 docs/
 ├── api.md                          # endpoint reference
 ├── database_schema.md              # ER diagram
-└── adr/ADR-001-modular-monolith.md
+├── deployment.md                   # V1: step-by-step AWS deployment commands
+└── adr/
+    ├── ADR-001-modular-monolith.md
+    └── ADR-002-aws-foundation.md
+
+infra/                             # V1: Terraform (see "Deploying to AWS" below)
+├── bootstrap/                      # one-time: remote state S3 bucket + DynamoDB lock table
+├── modules/                        # vpc, security_groups, ecr, s3, iam, rds, alb, ecs, cloudwatch
+└── environments/dev/               # wires the modules together for the dev environment
+
+.github/workflows/deploy.yml        # V1: build/push to ECR + redeploy ECS on push to main
 ```
 
 ## Tech stack
@@ -100,6 +113,44 @@ See [docs/database_schema.md](docs/database_schema.md) for the ER diagram and ta
 * **ACID transactions** — order creation, item persistence, and stock decrement commit atomically; payment failure triggers a compensating restock (a small preview of the Saga pattern from V12).
 * **Basic API design** — resource-oriented REST endpoints, explicit status codes (404/409), request/response schemas separate from persistence models.
 
+## Deploying to AWS (V1)
+
+Same application code and Docker image as V0 — no microservices yet. Deployed on ECS/Fargate behind an ALB, with RDS PostgreSQL replacing the Docker Compose Postgres container.
+
+```mermaid
+flowchart TB
+    Internet((Internet)) --> ALB[ALB :80]
+    subgraph vpc [VPC 10.0.0.0/16]
+        subgraph public [Public subnets]
+            ALB
+            NAT[NAT Gateway]
+        end
+        subgraph private [Private subnets]
+            ECS["ECS Fargate task(s)<br/>commerceops-app"]
+            RDS[("RDS PostgreSQL")]
+        end
+    end
+    ALB --> ECS
+    ECS --> RDS
+    ECS -.pulls image.-> ECR[(ECR)]
+    ECS -.logs.-> CW[CloudWatch]
+    ECS -.reads secret.-> SM[Secrets Manager]
+    GHA[GitHub Actions] -.OIDC.-> ECR
+    GHA -.force redeploy.-> ECS
+```
+
+* **Infrastructure as code**: Terraform, under [infra/](infra/) — `bootstrap/` (one-time remote state backend), `modules/` (vpc, security_groups, ecr, s3, iam, rds, alb, ecs, cloudwatch), `environments/dev/` (wires them together).
+* **CI/CD**: [.github/workflows/deploy.yml](.github/workflows/deploy.yml) builds the Docker image, pushes to ECR, and force-redeploys the ECS service on every push to `main` that touches `app/**`/`Dockerfile` — authenticated via GitHub OIDC (no long-lived AWS keys).
+* **Full step-by-step commands** (install CLIs, bootstrap state, `terraform apply`, first image push, verification, teardown): [docs/deployment.md](docs/deployment.md).
+* **Why ECS/Fargate/RDS/private-subnets, what the ALB does, what happens when a task dies, and the trade-offs made** (single NAT GW, single-AZ RDS, HTTP-only ALB, `:latest`-tag deploys): [ADR-002](docs/adr/ADR-002-aws-foundation.md).
+
 ## Roadmap
 
-This repository will evolve version by version, per the [learning project plan](../Solution%20Architect%20Learning%20Project.md): V1 AWS Foundation, V2 Horizontal Scaling, V3 Redis Caching, V4 Async Processing, and onward through microservices, event-driven architecture, CQRS, Saga, and an AI Operations Agent.
+* [x] V0 — Local Modular Monolith
+* [x] V1 — AWS Foundation
+* [ ] V2 — Horizontal Scaling
+* [ ] V3 — Redis Caching
+* [ ] V4 — Asynchronous Processing (SQS)
+* [ ] V5+ — Reliability, HA, Microservices, Event-Driven Architecture, Kafka, CQRS, Outbox, Saga, AI Operations Agent, Observability, Security, Disaster Recovery, Cost Optimization
+
+Per the [learning project plan](../Solution%20Architect%20Learning%20Project.md).
