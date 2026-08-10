@@ -22,9 +22,11 @@ Base URL (local): `http://localhost:8000`
 | Method | Path               | Body                                                     | Notes                     |
 | ------ | ------------------- | --------------------------------------------------------- | -------------------------- |
 | POST   | `/products`         | `{name, description?, price, stock_quantity?}`            |                             |
-| GET    | `/products`         | query: `skip`, `limit`                                     | list                        |
-| GET    | `/products/{id}`    | -                                                           | 404 if not found            |
-| PUT    | `/products/{id}`    | any subset of `{name, description, price, stock_quantity}` | partial update              |
+| GET    | `/products`         | query: `skip`, `limit`                                     | list, cache-aside (see below) |
+| GET    | `/products/{id}`    | -                                                           | 404 if not found, cache-aside (see below) |
+| PUT    | `/products/{id}`    | any subset of `{name, description, price, stock_quantity}` | partial update, invalidates the detail cache |
+
+**Caching (V3)**: both GET endpoints are served cache-aside from Redis (`cache_ttl_seconds`, default 15s). `GET /products/{id}` is invalidated immediately on `PUT`; `GET /products` listings may lag a write by up to `cache_ttl_seconds` (bounded staleness, not actively invalidated — see [ADR-004](adr/ADR-004-caching.md)). If Redis is unavailable, both endpoints keep working by falling back to PostgreSQL.
 
 ## Orders
 

@@ -62,6 +62,16 @@ module "rds" {
   tags               = local.tags
 }
 
+module "elasticache" {
+  source = "../../modules/elasticache"
+
+  name               = local.name
+  private_subnet_ids = module.vpc.private_subnet_ids
+  security_group_id  = module.security_groups.redis_sg_id
+  node_type          = var.redis_node_type
+  tags               = local.tags
+}
+
 module "iam" {
   source = "../../modules/iam"
 
@@ -98,6 +108,7 @@ module "cloudwatch" {
   alb_arn_suffix          = module.alb.arn_suffix
   target_group_arn_suffix = module.alb.target_group_arn_suffix
   rds_instance_identifier = module.rds.identifier
+  redis_cluster_id        = module.elasticache.cluster_id
   alarm_email             = var.alarm_email
   tags                    = local.tags
 }
@@ -122,6 +133,10 @@ module "ecs" {
   db_host            = module.rds.address
   db_port            = module.rds.port
   db_name            = module.rds.db_name
+  redis_host         = module.elasticache.address
+  redis_port         = module.elasticache.port
+  cache_ttl_seconds  = var.cache_ttl_seconds
+  cache_enabled      = var.cache_enabled
   tags               = local.tags
 }
 

@@ -39,3 +39,8 @@ output "ecs_autoscaling_min_capacity" {
 output "ecs_autoscaling_max_capacity" {
   value = module.autoscaling.max_capacity
 }
+
+output "redis_endpoint" {
+  description = "ElastiCache Redis endpoint (host:port)"
+  value       = "${module.elasticache.address}:${module.elasticache.port}"
+}

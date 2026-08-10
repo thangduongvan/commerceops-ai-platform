@@ -5,6 +5,7 @@ The [CommerceOps AI Platform learning project](../Solution%20Architect%20Learnin
 * **V0 — Local Modular Monolith**: Docker Compose, no AWS. See below.
 * **V1 — AWS Foundation**: deploy the same app to ECS/Fargate behind an ALB, backed by RDS. See [Deploying to AWS (V1)](#deploying-to-aws-v1) below.
 * **V2 — Horizontal Scaling**: ECS Service Auto Scaling (CPU/memory/request-count target tracking) + tuned DB connection pooling + a Locust load test, for a flash-sale traffic spike. See [Horizontal Scaling (V2)](#horizontal-scaling-v2) below.
+* **V3 — Caching**: Redis cache-aside in front of the read-heavy Product endpoints (ElastiCache in AWS), so a flash sale's 90%+ read traffic mostly stops hitting Postgres at all. See [Caching (V3)](#caching-v3) below.
 
 ## V0: Local architecture
 
@@ -31,7 +32,8 @@ app/
 ├── main.py                 # FastAPI app, routers, startup table creation
 ├── core/
 │   ├── config.py           # environment-driven settings
-│   └── database.py         # SQLAlchemy engine/session, Base, get_db
+│   ├── database.py         # SQLAlchemy engine/session, Base, get_db
+│   └── cache.py            # V3: Redis cache-aside helpers (get/set/delete, TTL jitter)
 ├── customer/                # create, get
 ├── product/                  # create, get, list, update
 ├── order/                     # create, get, list, cancel (+ transaction logic)
@@ -45,15 +47,16 @@ tests/
 docs/
 ├── api.md                          # endpoint reference
 ├── database_schema.md              # ER diagram
-├── deployment.md                   # V1: step-by-step AWS deployment; V2: load-test run guide
+├── deployment.md                   # V1: step-by-step AWS deployment; V2: load-test run guide; V3: caching experiment
 └── adr/
     ├── ADR-001-modular-monolith.md
     ├── ADR-002-aws-foundation.md
-    └── ADR-003-horizontal-scaling.md
+    ├── ADR-003-horizontal-scaling.md
+    └── ADR-004-caching.md
 
-infra/                             # V1/V2: Terraform (see "Deploying to AWS" below)
+infra/                             # V1/V2/V3: Terraform (see "Deploying to AWS" below)
 ├── bootstrap/                      # one-time: remote state S3 bucket + DynamoDB lock table
-├── modules/                        # vpc, security_groups, ecr, s3, iam, rds, alb, ecs, autoscaling, cloudwatch
+├── modules/                        # vpc, security_groups, ecr, s3, iam, rds, elasticache, alb, ecs, autoscaling, cloudwatch
 └── environments/dev/               # wires the modules together for the dev environment
 
 loadtest/                          # V2: Locust load test (see "Horizontal Scaling" below)
@@ -65,7 +68,7 @@ loadtest/                          # V2: Locust load test (see "Horizontal Scali
 
 ## Tech stack
 
-Python 3.11+, FastAPI, SQLAlchemy 2.0, PostgreSQL 16, Docker / Docker Compose, pytest, Locust (V2 load testing).
+Python 3.11+, FastAPI, SQLAlchemy 2.0, PostgreSQL 16, Redis 7 (V3 caching), Docker / Docker Compose, pytest, Locust (V2 load testing).
 
 ## Running with Docker Compose (recommended)
 
@@ -176,12 +179,38 @@ flowchart TB
 * **Load test**: [loadtest/locustfile.py](loadtest/locustfile.py) (Locust) — run the staged 100/500/1,000/5,000 req/s experiment from [docs/deployment.md](docs/deployment.md#6-v2-load-testing-horizontal-scaling).
 * **Why app-tier scaling alone doesn't solve DB scaling** (connections, CPU/IOPS, hot-row contention — and why that motivates V3's cache rather than a bigger DB immediately): [ADR-003](docs/adr/ADR-003-horizontal-scaling.md).
 
+## Caching (V3)
+
+New requirement: during a flash sale, product listing/browsing is 90%+ of traffic, and product data changes relatively infrequently. Rather than scaling Postgres itself, a Redis cache-aside layer absorbs most of that read traffic before it ever reaches the database.
+
+```mermaid
+flowchart TB
+    Internet((Internet)) --> ALB
+    subgraph asg [ECS Service, 2-8 tasks]
+        T1[Task]
+        T2["Task ..."]
+    end
+    ALB --> T1
+    ALB --> T2
+    T1 -->|1: check cache| Redis[("ElastiCache Redis<br/>single node")]
+    T2 --> Redis
+    T1 -->|"2: miss -> query"| RDS[("RDS PostgreSQL")]
+    T2 --> RDS
+    RDS -->|"3: populate, TTL+jitter"| Redis
+```
+
+* **Cache-aside on the Product endpoints**: [app/product/service.py](app/product/service.py), using the small helper module [app/core/cache.py](app/core/cache.py) — `GET /products/{id}` (key `product:{id}`, invalidated on `PUT`) and `GET /products` (key `products:list:{skip}:{limit}`, TTL-only — see ADR-004 for why listings aren't actively invalidated).
+* **Graceful degradation**: every Redis call is wrapped so a connection error/timeout degrades to a cache miss, never an application error — Redis is never the source of truth, Postgres is. A `CACHE_ENABLED` env var can also disable caching entirely for the "without cache vs with cache" experiment.
+* **Infra**: [infra/modules/elasticache](infra/modules/elasticache) — single-node ElastiCache Redis cluster, private-subnet-only via a new `redis` security group (ECS -> Redis, same three-tier pattern as ALB -> ECS -> RDS).
+* **Load test**: [loadtest/locustfile.py](loadtest/locustfile.py) now biases `get_product` toward a small "hot" subset of products, so the cache hit-ratio experiment in [docs/deployment.md](docs/deployment.md#7-v3-caching) has a realistic traffic shape to measure against.
+* **Why Redis over a per-process cache or a read replica, and explicit answers to "what happens when Redis dies / should it be the source of truth / how do you invalidate it"**: [ADR-004](docs/adr/ADR-004-caching.md).
+
 ## Roadmap
 
 * [x] V0 — Local Modular Monolith
 * [x] V1 — AWS Foundation
 * [x] V2 — Horizontal Scaling
-* [ ] V3 — Redis Caching
+* [x] V3 — Redis Caching
 * [ ] V4 — Asynchronous Processing (SQS)
 * [ ] V5+ — Reliability, HA, Microservices, Event-Driven Architecture, Kafka, CQRS, Outbox, Saga, AI Operations Agent, Observability, Security, Disaster Recovery, Cost Optimization
 

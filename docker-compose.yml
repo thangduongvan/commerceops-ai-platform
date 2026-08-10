@@ -15,16 +15,31 @@ services:
       timeout: 5s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   app:
     build: .
     environment:
       DATABASE_URL: postgresql+psycopg://commerceops:commerceops@db:5432/commerceops
       APP_NAME: CommerceOps AI Platform
       ENVIRONMENT: local
+      REDIS_URL: redis://redis:6379/0
+      CACHE_TTL_SECONDS: 15
+      CACHE_ENABLED: "true"
     ports:
       - "8000:8000"
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
 volumes:

@@ -20,6 +20,12 @@ variable "db_port" {
   default     = 5432
 }
 
+variable "redis_port" {
+  description = "Port Redis listens on"
+  type        = number
+  default     = 6379
+}
+
 variable "tags" {
   description = "Common tags applied to all resources"
   type        = map(string)

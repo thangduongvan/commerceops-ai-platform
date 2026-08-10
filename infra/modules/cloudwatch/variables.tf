@@ -43,6 +43,23 @@ variable "rds_connections_threshold" {
   default     = 80
 }
 
+variable "redis_cluster_id" {
+  description = "ElastiCache cluster id, for the Redis-tier alarms added in V3 (see ADR-004)"
+  type        = string
+}
+
+variable "redis_cpu_threshold" {
+  description = "ElastiCache Redis CPUUtilization (%) above which the cache-tier alarm fires"
+  type        = number
+  default     = 80
+}
+
+variable "redis_evictions_threshold" {
+  description = "ElastiCache Redis Evictions (count/period) above which the memory-pressure alarm fires"
+  type        = number
+  default     = 0
+}
+
 variable "alarm_email" {
   description = "Email address to notify on alarm. Leave empty to skip the SNS subscription (topic is still created)."
   type        = string

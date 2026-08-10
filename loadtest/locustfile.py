@@ -1,10 +1,11 @@
-"""V2 (Horizontal Scaling) load test.
+"""V2 (Horizontal Scaling) + V3 (Caching) load test.
 
 Simulates the flash-sale traffic shape from the learning project spec:
 mostly product listing/browsing, with a smaller slice of real order
 creation. Point this at either the local Docker Compose stack or the
-deployed ALB DNS name -- see docs/deployment.md's "V2: Load testing"
-section for the staged 100/500/1000/5000 req/s run commands.
+deployed ALB DNS name -- see docs/deployment.md's "V2: Load testing" and
+"V3: Caching" sections for staged run commands and the cache on/off
+comparison.
 
     locust -f loadtest/locustfile.py --host http://localhost:8000
     locust -f loadtest/locustfile.py --host http://<alb_dns_name> \\
@@ -21,9 +22,20 @@ from locust import HttpUser, between, events, task
 
 PRODUCT_IDS: list[int] = []
 CUSTOMER_IDS: list[int] = []
+# V3: a small "hot" subset of PRODUCT_IDS, filled in once seeding finishes.
+HOT_PRODUCT_IDS: list[int] = []
 
 SEED_PRODUCT_COUNT = 20
 SEED_CUSTOMER_COUNT = 20
+# Real product catalogs are rarely browsed uniformly -- a handful of
+# products get most of the views. Modeling that "hot key" shape gives the
+# cache hit-ratio experiment (docs/deployment.md, "V3: Caching") something
+# meaningful to show: the hot subset should sit in Redis almost permanently,
+# while the long tail round-trips through the cache-aside path more often.
+HOT_PRODUCT_COUNT = 3
+# Fraction of single-product lookups aimed at the hot subset rather than a
+# uniformly random product.
+HOT_PRODUCT_TRAFFIC_SHARE = 0.7
 # High stock so a 10-minute flash-sale run doesn't legitimately sell out and
 # start masking scaling behavior behind 409 "out of stock" responses.
 SEED_PRODUCT_STOCK = 1_000_000
@@ -53,6 +65,8 @@ def seed_data(environment, **kwargs):
         resp.raise_for_status()
         PRODUCT_IDS.append(resp.json()["id"])
 
+    HOT_PRODUCT_IDS.extend(PRODUCT_IDS[:HOT_PRODUCT_COUNT])
+
     for i in range(SEED_CUSTOMER_COUNT):
         resp = requests.post(
             f"{host}/customers",
@@ -78,7 +92,10 @@ class CommerceOpsUser(HttpUser):
     def get_product(self):
         if not PRODUCT_IDS:
             return
-        product_id = random.choice(PRODUCT_IDS)
+        if HOT_PRODUCT_IDS and random.random() < HOT_PRODUCT_TRAFFIC_SHARE:
+            product_id = random.choice(HOT_PRODUCT_IDS)
+        else:
+            product_id = random.choice(PRODUCT_IDS)
         self.client.get(f"/products/{product_id}", name="/products/[id]")
 
     @task(1)

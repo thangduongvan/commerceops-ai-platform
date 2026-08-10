@@ -1,4 +1,4 @@
-# Deployment Guide — AWS Foundation (V1) + Horizontal Scaling (V2)
+# Deployment Guide — AWS Foundation (V1) + Horizontal Scaling (V2) + Caching (V3)
 
 Step-by-step commands to deploy CommerceOps to AWS (ECS/Fargate + ALB + RDS) from a Windows machine using PowerShell. All Terraform lives under [infra/](../infra/).
 
@@ -54,7 +54,7 @@ terraform plan
 terraform apply
 ```
 
-This creates the VPC, ALB, ECS cluster/service (+ Auto Scaling target/policies, per [ADR-003](adr/ADR-003-horizontal-scaling.md)), RDS instance, ECR repo, S3 buckets, IAM roles, and CloudWatch resources. **The ECS service will show 0/2 healthy tasks after this apply** — there's no image in ECR yet, so tasks can't start. That's expected; fixed in the next step.
+This creates the VPC, ALB, ECS cluster/service (+ Auto Scaling target/policies, per [ADR-003](adr/ADR-003-horizontal-scaling.md)), RDS instance, ElastiCache Redis cluster (per [ADR-004](adr/ADR-004-caching.md)), ECR repo, S3 buckets, IAM roles, and CloudWatch resources. **The ECS service will show 0/2 healthy tasks after this apply** — there's no image in ECR yet, so tasks can't start. That's expected; fixed in the next step.
 
 Save the outputs — you'll need them below:
 
@@ -146,7 +146,60 @@ while ($true) {
 
 Record latency, throughput, CPU/memory, error rate, and DB connection count for each stage — that comparison is the actual deliverable of V2's "Experiment" section in the learning project spec.
 
-## 7. Wire up GitHub Actions CI/CD
+## 7. V3: Caching
+
+Adds a Redis cache-aside layer in front of `GET /products` and `GET /products/{id}` — see [ADR-004](adr/ADR-004-caching.md) for the design and the required "what happens when Redis dies?" etc. answers. Requires the stack from steps 1-5 (now also provisioning an ElastiCache cluster).
+
+### 7.1 Experiment: without cache vs with cache
+
+The `CACHE_ENABLED` env var (wired through `infra/environments/dev`'s `cache_enabled` variable, defaulting to `true`) lets you A/B this without touching any other infrastructure:
+
+```powershell
+# Baseline: cache OFF
+cd infra/environments/dev
+terraform apply -var="cache_enabled=false"
+$CLUSTER = terraform output -raw ecs_cluster_name
+$SERVICE = terraform output -raw ecs_service_name
+aws ecs wait services-stable --cluster $CLUSTER --services $SERVICE
+
+cd ../../../loadtest
+locust -f locustfile.py --host "http://$ALB_DNS" --headless -u 1000 -r 50 --run-time 5m --csv no-cache
+
+# Cache ON — flip it back and rerun the same stage
+cd ../infra/environments/dev
+terraform apply -var="cache_enabled=true"
+aws ecs wait services-stable --cluster $CLUSTER --services $SERVICE
+
+cd ../../../loadtest
+locust -f locustfile.py --host "http://$ALB_DNS" --headless -u 1000 -r 50 --run-time 5m --csv with-cache
+```
+
+Compare, cache off vs on:
+
+* **Locust output / `*_stats.csv`**: p50/p95 latency, achieved req/s.
+* **RDS CloudWatch metrics** (`DatabaseConnections`, `ReadIOPS`, `CPUUtilization` — same dashboards/alarms V2 added): DB query load should drop sharply with the cache on, since `list_products` dominates traffic at 90%+ per the flash-sale scenario.
+
+### 7.2 Reading the cache hit ratio
+
+* **Locally** (Docker Compose): `docker compose exec redis redis-cli INFO stats | findstr keyspace` — `keyspace_hits` / (`keyspace_hits` + `keyspace_misses`) is the hit ratio.
+* **AWS**: CloudWatch → Metrics → `AWS/ElastiCache` → `CacheHits` / `CacheMisses` for the cluster (`terraform output redis_endpoint` to find it). Expect the loadtest's biased "hot" product subset (see `loadtest/locustfile.py`) to show a much higher hit ratio than the long tail of products.
+* **Alarms**: `*-redis-cpu-high` / `*-redis-evictions-high` — evictions firing means the node is smaller than its working set (bump `redis_node_type` if so).
+
+### 7.3 Failure injection: what happens when Redis dies?
+
+Confirms the fallback behavior documented in ADR-004 — the app should keep serving Product reads (just slower, and with more DB load), never error out.
+
+Locally:
+
+```powershell
+docker compose stop redis
+curl http://localhost:8000/products   # should still return 200
+docker compose start redis
+```
+
+On AWS, the equivalent is temporarily pointing `REDIS_HOST` at an address nothing is listening on (e.g. via `terraform apply -var="redis_node_type=..."` won't do this — instead, briefly override the ECS task definition's `REDIS_HOST` env var, redeploy, confirm `/products` still returns 200, then revert) or simply stopping/deleting the ElastiCache cluster and rerunning a Locust stage against the ALB.
+
+## 8. Wire up GitHub Actions CI/CD
 
 In the GitHub repo: **Settings → Secrets and variables → Actions → Variables**, add:
 
@@ -160,19 +213,20 @@ In the GitHub repo: **Settings → Secrets and variables → Actions → Variabl
 
 No AWS access keys are stored in GitHub — [.github/workflows/deploy.yml](../.github/workflows/deploy.yml) assumes `AWS_ROLE_ARN` via GitHub's OIDC token. From now on, pushes to `main` touching `app/**`/`Dockerfile` automatically build, push, and redeploy.
 
-## 8. Cost control: tear it down when you're done
+## 9. Cost control: tear it down when you're done
 
-Per the learning project's "deploy → test → destroy" principle (avoid paying for idle ALB/NAT/RDS between sessions):
+Per the learning project's "deploy → test → destroy" principle (avoid paying for idle ALB/NAT/RDS/ElastiCache between sessions):
 
 ```powershell
 cd infra/environments/dev
 terraform destroy
 ```
 
-Leave the `infra/bootstrap` state bucket/lock table in place (they cost effectively nothing) so you don't have to redo step 1 next time. Re-running steps 3-7 later recreates everything from the same Terraform code.
+Leave the `infra/bootstrap` state bucket/lock table in place (they cost effectively nothing) so you don't have to redo step 1 next time. Re-running steps 3-8 later recreates everything from the same Terraform code.
 
 ## Troubleshooting
 
 * **Tasks stuck in `PENDING`/`STOPPED` immediately after `terraform apply`**: expected before step 4 — no image in ECR yet. Check `aws ecs describe-tasks` / the CloudWatch log group for the actual failure reason if it persists after pushing an image.
 * **ALB returns 503**: target group has no healthy targets yet — check ECS service events (`aws ecs describe-services --cluster ... --services ...`) and the `/health` path/port match the app's actual listen port (8000).
 * **`terraform init` backend error**: double check `backend.tf` has the exact bucket/table names from `infra/bootstrap` outputs, and that your AWS credentials can access them.
+* **Products endpoints work but seem to ignore recent writes**: check `CACHE_ENABLED` — if `true`, `GET /products` listings are only guaranteed fresh within `cache_ttl_seconds` (see [ADR-004](adr/ADR-004-caching.md)'s "how do you invalidate the cache?"). `GET /products/{id}` is invalidated immediately on update, so if that's stale too, check the app logs for `cache_get_json`/`cache_delete` warnings — likely Redis is unreachable and every request is silently falling back to Postgres.

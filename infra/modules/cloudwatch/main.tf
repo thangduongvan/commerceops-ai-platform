@@ -129,6 +129,53 @@ resource "aws_cloudwatch_metric_alarm" "rds_connections_high" {
   tags = var.tags
 }
 
+### V3: Redis-tier alarms. Surface the new cache's health the same way V2
+### did for RDS. High CPU/evictions here don't threaten correctness (Redis
+### isn't the source of truth), but they do mean the cache is losing keys
+### faster than expected — worth knowing before it shows up as increased
+### DB load instead (see docs/adr/ADR-004-caching.md).
+
+resource "aws_cloudwatch_metric_alarm" "redis_cpu_high" {
+  alarm_name          = "${var.name}-redis-cpu-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/ElastiCache"
+  period              = 60
+  statistic           = "Average"
+  threshold           = var.redis_cpu_threshold
+  alarm_description   = "ElastiCache Redis CPU utilization > ${var.redis_cpu_threshold}% for 3 minutes"
+  alarm_actions       = [aws_sns_topic.alarms.arn]
+  ok_actions          = [aws_sns_topic.alarms.arn]
+
+  dimensions = {
+    CacheClusterId = var.redis_cluster_id
+  }
+
+  tags = var.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "redis_evictions_high" {
+  alarm_name          = "${var.name}-redis-evictions-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "Evictions"
+  namespace           = "AWS/ElastiCache"
+  period              = 60
+  statistic           = "Sum"
+  threshold           = var.redis_evictions_threshold
+  alarm_description   = "ElastiCache Redis is evicting keys under memory pressure — cache is smaller than its working set"
+  alarm_actions       = [aws_sns_topic.alarms.arn]
+  ok_actions          = [aws_sns_topic.alarms.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    CacheClusterId = var.redis_cluster_id
+  }
+
+  tags = var.tags
+}
+
 resource "aws_cloudwatch_metric_alarm" "alb_unhealthy_hosts" {
   alarm_name          = "${var.name}-alb-unhealthy-hosts"
   comparison_operator = "GreaterThanThreshold"

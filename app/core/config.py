@@ -39,6 +39,27 @@ class Settings(BaseSettings):
     db_pool_size: int = 5
     db_max_overflow: int = 3
 
+    # V3 (Caching): same "assemble from parts" pattern as the database URL
+    # above. ECS injects REDIS_HOST/REDIS_PORT as plain (non-secret) env vars
+    # — Redis has no AUTH/TLS in this setup, see docs/adr/ADR-004-caching.md.
+    # Local Docker Compose just sets REDIS_URL directly, unchanged.
+    redis_url: str = "redis://redis:6379/0"
+    redis_host: Optional[str] = None
+    redis_port: int = 6379
+
+    redis_max_connections: int = 10
+    redis_socket_timeout_seconds: float = 0.2
+
+    # Product reads (detail + listing) are cached for this long. Short enough
+    # to bound staleness on the un-invalidated listing cache (see
+    # app/product/service.py), long enough to cut DB load meaningfully during
+    # a flash sale's 90%+ read traffic.
+    cache_ttl_seconds: int = 15
+
+    # Lets the "without cache vs with cache" experiment (docs/deployment.md)
+    # toggle caching off entirely via one env var, no redeploy of infra needed.
+    cache_enabled: bool = True
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @model_validator(mode="after")
@@ -50,6 +71,12 @@ class Settings(BaseSettings):
                 f"postgresql+psycopg://{user}:{password}"
                 f"@{self.db_host}:{self.db_port}/{self.db_name}"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _assemble_redis_url_from_parts(self) -> "Settings":
+        if self.redis_host:
+            self.redis_url = f"redis://{self.redis_host}:{self.redis_port}/0"
         return self
 
 

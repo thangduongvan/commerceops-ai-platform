@@ -28,6 +28,13 @@ ecs_cpu_target_value            = 60
 ecs_memory_target_value         = 70
 ecs_request_count_target_value  = 300
 
+# V3 — Caching: ElastiCache Redis in front of product reads. cache_enabled
+# toggles the "without cache vs with cache" experiment without touching
+# infra — see ADR-004.
+redis_node_type   = "cache.t3.micro"
+cache_ttl_seconds = 15
+cache_enabled     = true
+
 # Must match the repo hosting this code, or the GitHub Actions OIDC trust policy
 # will reject the workflow's token.
 github_repo   = "thangduongvan/commerceops-ai-platform"

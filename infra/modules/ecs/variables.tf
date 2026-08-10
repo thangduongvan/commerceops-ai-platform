@@ -74,6 +74,25 @@ variable "db_name" {
   type = string
 }
 
+variable "redis_host" {
+  type = string
+}
+
+variable "redis_port" {
+  type    = number
+  default = 6379
+}
+
+variable "cache_ttl_seconds" {
+  type    = number
+  default = 15
+}
+
+variable "cache_enabled" {
+  type    = bool
+  default = true
+}
+
 variable "app_name" {
   type    = string
   default = "CommerceOps AI Platform"

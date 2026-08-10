@@ -108,6 +108,26 @@ variable "ecs_request_count_target_value" {
   default     = 300
 }
 
+# V3 — Caching (see docs/adr/ADR-004-caching.md)
+
+variable "redis_node_type" {
+  description = "ElastiCache Redis node instance type"
+  type        = string
+  default     = "cache.t3.micro"
+}
+
+variable "cache_ttl_seconds" {
+  description = "TTL for cached product reads (detail + listing). Bounds staleness on the un-invalidated listing cache — see ADR-004."
+  type        = number
+  default     = 15
+}
+
+variable "cache_enabled" {
+  description = "Toggle for the V3 'without cache vs with cache' experiment. Set false to bypass Redis entirely without touching infra."
+  type        = bool
+  default     = true
+}
+
 variable "github_repo" {
   description = "GitHub repo allowed to deploy via OIDC, in \"owner/repo\" form"
   type        = string

@@ -1,4 +1,4 @@
-### Three-tier security group chain: internet -> ALB -> ECS tasks -> RDS.
+### Security group chain: internet -> ALB -> ECS tasks -> RDS / Redis.
 ### Each tier only accepts traffic from the tier directly in front of it
 ### (security-group-to-security-group references, no wide-open CIDRs beyond the ALB).
 
@@ -69,4 +69,27 @@ resource "aws_security_group" "rds" {
   }
 
   tags = merge(var.tags, { Name = "${var.name}-rds-sg" })
+}
+
+resource "aws_security_group" "redis" {
+  name        = "${var.name}-redis-sg"
+  description = "Allow inbound Redis from ECS tasks only"
+  vpc_id      = var.vpc_id
+
+  ingress {
+    description     = "Redis from ECS tasks"
+    from_port       = var.redis_port
+    to_port         = var.redis_port
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ecs.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(var.tags, { Name = "${var.name}-redis-sg" })
 }

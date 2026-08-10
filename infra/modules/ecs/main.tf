@@ -37,6 +37,13 @@ resource "aws_ecs_task_definition" "app" {
         { name = "DB_HOST", value = var.db_host },
         { name = "DB_PORT", value = tostring(var.db_port) },
         { name = "DB_NAME", value = var.db_name },
+        # V3 (Caching): no `secrets` entry needed here — this ElastiCache
+        # cluster has no AUTH token/TLS (see docs/adr/ADR-004-caching.md),
+        # so host/port are as safe to log/inspect as DB_HOST/DB_PORT above.
+        { name = "REDIS_HOST", value = var.redis_host },
+        { name = "REDIS_PORT", value = tostring(var.redis_port) },
+        { name = "CACHE_TTL_SECONDS", value = tostring(var.cache_ttl_seconds) },
+        { name = "CACHE_ENABLED", value = tostring(var.cache_enabled) },
       ]
 
       # Only the credentials come from Secrets Manager — host/port/dbname are not
