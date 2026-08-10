@@ -33,6 +33,10 @@ docker-compose.override.yml
 .DS_Store
 Thumbs.db
 
+## Load testing (V2)
+loadtest/*.html
+loadtest/*_stats*.csv
+
 ## Terraform
 **/.terraform/*
 *.tfstate

@@ -20,3 +20,8 @@ output "master_user_secret_arn" {
   description = "ARN of the Secrets Manager secret AWS created for the master password"
   value       = aws_db_instance.this.master_user_secret[0].secret_arn
 }
+
+output "identifier" {
+  description = "DB instance identifier, used to dimension CloudWatch alarms (e.g. DatabaseConnections)"
+  value       = aws_db_instance.this.identifier
+}

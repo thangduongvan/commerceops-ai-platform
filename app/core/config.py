@@ -31,6 +31,14 @@ class Settings(BaseSettings):
     db_username: Optional[str] = None
     db_password: Optional[str] = None
 
+    # V2 (Horizontal Scaling): explicit, small pool per task. Every ECS task
+    # runs its own process with its own pool, so the RDS connection ceiling is
+    # roughly `running_tasks * (db_pool_size + db_max_overflow)`, not a single
+    # global number — see docs/adr/ADR-003-horizontal-scaling.md for the math
+    # against db.t3.micro's default max_connections (~112) at max_capacity.
+    db_pool_size: int = 5
+    db_max_overflow: int = 3
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @model_validator(mode="after")

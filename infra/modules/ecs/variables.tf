@@ -36,9 +36,9 @@ variable "memory" {
 }
 
 variable "desired_count" {
-  description = "Number of tasks. Kept at 1 for V1 — Auto Scaling arrives in V2."
+  description = "Initial number of tasks. From V2 onward this is only the starting point — Application Auto Scaling (infra/modules/autoscaling) manages it afterwards and this module ignores drift on it (see lifecycle block below)."
   type        = number
-  default     = 1
+  default     = 2
 }
 
 variable "execution_role_arn" {

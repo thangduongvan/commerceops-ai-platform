@@ -97,6 +97,7 @@ module "cloudwatch" {
   ecs_service_name        = local.ecs_service_name
   alb_arn_suffix          = module.alb.arn_suffix
   target_group_arn_suffix = module.alb.target_group_arn_suffix
+  rds_instance_identifier = module.rds.identifier
   alarm_email             = var.alarm_email
   tags                    = local.tags
 }
@@ -122,4 +123,21 @@ module "ecs" {
   db_port            = module.rds.port
   db_name            = module.rds.db_name
   tags               = local.tags
+}
+
+module "autoscaling" {
+  source = "../../modules/autoscaling"
+
+  name                       = local.name
+  ecs_cluster_name           = module.ecs.cluster_name
+  ecs_service_name           = module.ecs.service_name
+  min_capacity               = var.ecs_min_capacity
+  max_capacity               = var.ecs_max_capacity
+  cpu_target_value           = var.ecs_cpu_target_value
+  memory_target_value        = var.ecs_memory_target_value
+  request_count_target_value = var.ecs_request_count_target_value
+  alb_arn_suffix             = module.alb.arn_suffix
+  target_group_arn_suffix    = module.alb.target_group_arn_suffix
+
+  depends_on = [module.ecs]
 }

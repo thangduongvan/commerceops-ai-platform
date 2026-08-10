@@ -1,0 +1,3 @@
+# V2 (Horizontal Scaling) load-testing tool. Kept separate from the app's own
+# requirements.txt so the production image never ships a load-test dependency.
+locust>=2.29,<3.0

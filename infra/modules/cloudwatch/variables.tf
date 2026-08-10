@@ -26,6 +26,23 @@ variable "target_group_arn_suffix" {
   type = string
 }
 
+variable "rds_instance_identifier" {
+  description = "RDS instance identifier, for the DB-tier alarms added in V2 (see ADR-003)"
+  type        = string
+}
+
+variable "rds_cpu_threshold" {
+  description = "RDS CPUUtilization (%) above which the DB-tier-is-the-bottleneck alarm fires"
+  type        = number
+  default     = 80
+}
+
+variable "rds_connections_threshold" {
+  description = "RDS DatabaseConnections count above which the connection-budget alarm fires. Should be set below max_connections minus headroom (see ADR-003's pool-sizing math)."
+  type        = number
+  default     = 80
+}
+
 variable "alarm_email" {
   description = "Email address to notify on alarm. Leave empty to skip the SNS subscription (topic is still created)."
   type        = string

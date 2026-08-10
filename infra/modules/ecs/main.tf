@@ -87,5 +87,15 @@ resource "aws_ecs_service" "app" {
   # (Trade-off documented in ADR-002: no per-deploy task-def history/easy rollback,
   # acceptable for a V1 learning project.)
 
+  # V2: Application Auto Scaling (infra/modules/autoscaling) owns desired_count
+  # after the initial apply — it raises/lowers it directly via the ECS API in
+  # response to CPU/memory/request-count targets. Without ignore_changes here,
+  # the next `terraform apply` would see the drift between the static
+  # `var.desired_count` and whatever Auto Scaling set at runtime, and reset it
+  # back down, fighting the very thing this version is trying to build.
+  lifecycle {
+    ignore_changes = [desired_count]
+  }
+
   tags = merge(var.tags, { Name = "${var.name}-app" })
 }

@@ -4,6 +4,7 @@ The [CommerceOps AI Platform learning project](../Solution%20Architect%20Learnin
 
 * **V0 — Local Modular Monolith**: Docker Compose, no AWS. See below.
 * **V1 — AWS Foundation**: deploy the same app to ECS/Fargate behind an ALB, backed by RDS. See [Deploying to AWS (V1)](#deploying-to-aws-v1) below.
+* **V2 — Horizontal Scaling**: ECS Service Auto Scaling (CPU/memory/request-count target tracking) + tuned DB connection pooling + a Locust load test, for a flash-sale traffic spike. See [Horizontal Scaling (V2)](#horizontal-scaling-v2) below.
 
 ## V0: Local architecture
 
@@ -44,22 +45,27 @@ tests/
 docs/
 ├── api.md                          # endpoint reference
 ├── database_schema.md              # ER diagram
-├── deployment.md                   # V1: step-by-step AWS deployment commands
+├── deployment.md                   # V1: step-by-step AWS deployment; V2: load-test run guide
 └── adr/
     ├── ADR-001-modular-monolith.md
-    └── ADR-002-aws-foundation.md
+    ├── ADR-002-aws-foundation.md
+    └── ADR-003-horizontal-scaling.md
 
-infra/                             # V1: Terraform (see "Deploying to AWS" below)
+infra/                             # V1/V2: Terraform (see "Deploying to AWS" below)
 ├── bootstrap/                      # one-time: remote state S3 bucket + DynamoDB lock table
-├── modules/                        # vpc, security_groups, ecr, s3, iam, rds, alb, ecs, cloudwatch
+├── modules/                        # vpc, security_groups, ecr, s3, iam, rds, alb, ecs, autoscaling, cloudwatch
 └── environments/dev/               # wires the modules together for the dev environment
+
+loadtest/                          # V2: Locust load test (see "Horizontal Scaling" below)
+├── locustfile.py
+└── requirements.txt
 
 .github/workflows/deploy.yml        # V1: build/push to ECR + redeploy ECS on push to main
 ```
 
 ## Tech stack
 
-Python 3.11+, FastAPI, SQLAlchemy 2.0, PostgreSQL 16, Docker / Docker Compose, pytest.
+Python 3.11+, FastAPI, SQLAlchemy 2.0, PostgreSQL 16, Docker / Docker Compose, pytest, Locust (V2 load testing).
 
 ## Running with Docker Compose (recommended)
 
@@ -139,16 +145,42 @@ flowchart TB
     GHA -.force redeploy.-> ECS
 ```
 
-* **Infrastructure as code**: Terraform, under [infra/](infra/) — `bootstrap/` (one-time remote state backend), `modules/` (vpc, security_groups, ecr, s3, iam, rds, alb, ecs, cloudwatch), `environments/dev/` (wires them together).
+* **Infrastructure as code**: Terraform, under [infra/](infra/) — `bootstrap/` (one-time remote state backend), `modules/` (vpc, security_groups, ecr, s3, iam, rds, alb, ecs, autoscaling, cloudwatch), `environments/dev/` (wires them together).
 * **CI/CD**: [.github/workflows/deploy.yml](.github/workflows/deploy.yml) builds the Docker image, pushes to ECR, and force-redeploys the ECS service on every push to `main` that touches `app/**`/`Dockerfile` — authenticated via GitHub OIDC (no long-lived AWS keys).
 * **Full step-by-step commands** (install CLIs, bootstrap state, `terraform apply`, first image push, verification, teardown): [docs/deployment.md](docs/deployment.md).
 * **Why ECS/Fargate/RDS/private-subnets, what the ALB does, what happens when a task dies, and the trade-offs made** (single NAT GW, single-AZ RDS, HTTP-only ALB, `:latest`-tag deploys): [ADR-002](docs/adr/ADR-002-aws-foundation.md).
+
+## Horizontal Scaling (V2)
+
+New requirement: a flash sale spikes traffic from ~300 req/s to ~5,000 req/s for ~10 minutes, then back to normal. The app must scale out and back in automatically instead of running a fixed task count sized for peak (wasteful) or for average (falls over during the spike).
+
+```mermaid
+flowchart TB
+    Internet((Internet)) --> ALB
+    subgraph asg [ECS Service, 2-8 tasks]
+        T1[Task]
+        T2[Task]
+        T3["Task ..."]
+    end
+    ALB --> T1
+    ALB --> T2
+    ALB --> T3
+    T1 --> RDS[("RDS PostgreSQL<br/>single instance")]
+    T2 --> RDS
+    T3 --> RDS
+    AAS[Application Auto Scaling] -.CPU / Memory / ReqCount.-> asg
+```
+
+* **Auto Scaling**: [infra/modules/autoscaling](infra/modules/autoscaling) — three target-tracking policies (CPU 60%, memory 70%, ALB requests/target 300) on one scalable target, `min_capacity=2`/`max_capacity=8`. `desired_count` on the ECS service is now just the *initial* count; Terraform ignores drift on it so Auto Scaling can own it at runtime.
+* **DB connection pool**: [app/core/database.py](app/core/database.py) / [app/core/config.py](app/core/config.py) — explicit `pool_size`/`max_overflow` per task, sized against RDS's connection ceiling at `max_capacity` tasks.
+* **Load test**: [loadtest/locustfile.py](loadtest/locustfile.py) (Locust) — run the staged 100/500/1,000/5,000 req/s experiment from [docs/deployment.md](docs/deployment.md#6-v2-load-testing-horizontal-scaling).
+* **Why app-tier scaling alone doesn't solve DB scaling** (connections, CPU/IOPS, hot-row contention — and why that motivates V3's cache rather than a bigger DB immediately): [ADR-003](docs/adr/ADR-003-horizontal-scaling.md).
 
 ## Roadmap
 
 * [x] V0 — Local Modular Monolith
 * [x] V1 — AWS Foundation
-* [ ] V2 — Horizontal Scaling
+* [x] V2 — Horizontal Scaling
 * [ ] V3 — Redis Caching
 * [ ] V4 — Asynchronous Processing (SQS)
 * [ ] V5+ — Reliability, HA, Microservices, Event-Driven Architecture, Kafka, CQRS, Outbox, Saga, AI Operations Agent, Observability, Security, Disaster Recovery, Cost Optimization

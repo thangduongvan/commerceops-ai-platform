@@ -31,3 +31,11 @@ output "github_actions_role_arn" {
 output "cloudwatch_log_group" {
   value = module.cloudwatch.log_group_name
 }
+
+output "ecs_autoscaling_min_capacity" {
+  value = module.autoscaling.min_capacity
+}
+
+output "ecs_autoscaling_max_capacity" {
+  value = module.autoscaling.max_capacity
+}

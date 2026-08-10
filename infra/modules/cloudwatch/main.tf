@@ -85,6 +85,50 @@ resource "aws_cloudwatch_metric_alarm" "alb_5xx_high" {
   tags = var.tags
 }
 
+### V2: DB-tier alarms. When the app tier scales out under load, these are
+### what reveal the database — not compute — becoming the actual bottleneck
+### (the "why doesn't app scaling solve DB scaling?" question in ADR-003).
+
+resource "aws_cloudwatch_metric_alarm" "rds_cpu_high" {
+  alarm_name          = "${var.name}-rds-cpu-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/RDS"
+  period              = 60
+  statistic           = "Average"
+  threshold           = var.rds_cpu_threshold
+  alarm_description   = "RDS CPU utilization > ${var.rds_cpu_threshold}% for 3 minutes — DB tier, not app tier, is now the bottleneck"
+  alarm_actions       = [aws_sns_topic.alarms.arn]
+  ok_actions          = [aws_sns_topic.alarms.arn]
+
+  dimensions = {
+    DBInstanceIdentifier = var.rds_instance_identifier
+  }
+
+  tags = var.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "rds_connections_high" {
+  alarm_name          = "${var.name}-rds-connections-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "DatabaseConnections"
+  namespace           = "AWS/RDS"
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = var.rds_connections_threshold
+  alarm_description   = "RDS open connections > ${var.rds_connections_threshold} for 2 minutes — approaching the connection budget scaled-out ECS tasks share (see ADR-003)"
+  alarm_actions       = [aws_sns_topic.alarms.arn]
+  ok_actions          = [aws_sns_topic.alarms.arn]
+
+  dimensions = {
+    DBInstanceIdentifier = var.rds_instance_identifier
+  }
+
+  tags = var.tags
+}
+
 resource "aws_cloudwatch_metric_alarm" "alb_unhealthy_hosts" {
   alarm_name          = "${var.name}-alb-unhealthy-hosts"
   comparison_operator = "GreaterThanThreshold"

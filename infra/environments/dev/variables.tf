@@ -71,8 +71,41 @@ variable "ecs_memory" {
 }
 
 variable "ecs_desired_count" {
-  type    = number
-  default = 1
+  description = "Initial task count. From V2 onward, Auto Scaling adjusts this at runtime (see infra/modules/ecs's ignore_changes on desired_count)."
+  type        = number
+  default     = 2
+}
+
+# V2 — Horizontal Scaling (see docs/adr/ADR-003-horizontal-scaling.md)
+
+variable "ecs_min_capacity" {
+  description = "Floor for Auto Scaling. >= 2 so a single task failure never drops the service to zero."
+  type        = number
+  default     = 2
+}
+
+variable "ecs_max_capacity" {
+  description = "Ceiling for Auto Scaling. Deliberately bounded by the RDS connection budget (db_pool_size + db_max_overflow per task), not just cost — see ADR-003."
+  type        = number
+  default     = 8
+}
+
+variable "ecs_cpu_target_value" {
+  description = "Target average CPU utilization (%) for the CPU target-tracking policy"
+  type        = number
+  default     = 60
+}
+
+variable "ecs_memory_target_value" {
+  description = "Target average memory utilization (%) for the memory target-tracking policy"
+  type        = number
+  default     = 70
+}
+
+variable "ecs_request_count_target_value" {
+  description = "Target ALB requests/sec/task for the request-count target-tracking policy"
+  type        = number
+  default     = 300
 }
 
 variable "github_repo" {

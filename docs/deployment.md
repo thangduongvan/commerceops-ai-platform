@@ -1,4 +1,4 @@
-# V1 Deployment Guide — AWS Foundation
+# Deployment Guide — AWS Foundation (V1) + Horizontal Scaling (V2)
 
 Step-by-step commands to deploy CommerceOps to AWS (ECS/Fargate + ALB + RDS) from a Windows machine using PowerShell. All Terraform lives under [infra/](../infra/).
 
@@ -54,7 +54,7 @@ terraform plan
 terraform apply
 ```
 
-This creates the VPC, ALB, ECS cluster/service, RDS instance, ECR repo, S3 buckets, IAM roles, and CloudWatch resources. **The ECS service will show 0/1 healthy tasks after this apply** — there's no image in ECR yet, so tasks can't start. That's expected; fixed in the next step.
+This creates the VPC, ALB, ECS cluster/service (+ Auto Scaling target/policies, per [ADR-003](adr/ADR-003-horizontal-scaling.md)), RDS instance, ECR repo, S3 buckets, IAM roles, and CloudWatch resources. **The ECS service will show 0/2 healthy tasks after this apply** — there's no image in ECR yet, so tasks can't start. That's expected; fixed in the next step.
 
 Save the outputs — you'll need them below:
 
@@ -98,7 +98,55 @@ curl "http://$ALB_DNS/docs"   # Swagger UI
 
 Check logs in CloudWatch: log group `/ecs/commerceops-dev-app` (or run `terraform -chdir=infra/environments/dev output cloudwatch_log_group`).
 
-## 6. Wire up GitHub Actions CI/CD
+## 6. V2: Load testing (horizontal scaling)
+
+This step exercises the Auto Scaling added in V2 — see [ADR-003](adr/ADR-003-horizontal-scaling.md) for why it's built this way. It requires the stack from steps 1-5 to already be up.
+
+Install the load-test tool (kept separate from the app's own `requirements.txt`):
+
+```powershell
+cd loadtest
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+Run the staged flash-sale experiment the learning project spec calls for — 100 / 500 / 1,000 / 5,000 req/s — against the ALB. Each stage below approximates the target req/s with concurrent users at the locustfile's `wait_time` of 1-3s per action (roughly `users / 2` req/s); adjust `-u`/`-r` if your own run doesn't match:
+
+```powershell
+$ALB_DNS = terraform -chdir=infra/environments/dev output -raw alb_dns_name
+
+# Baseline (~100 req/s)
+locust -f locustfile.py --host "http://$ALB_DNS" --headless -u 200 -r 20 --run-time 5m --csv stage-100
+
+# ~500 req/s
+locust -f locustfile.py --host "http://$ALB_DNS" --headless -u 1000 -r 50 --run-time 5m --csv stage-500
+
+# ~1,000 req/s
+locust -f locustfile.py --host "http://$ALB_DNS" --headless -u 2000 -r 100 --run-time 5m --csv stage-1000
+
+# Flash-sale peak (~5,000 req/s) for the full 10-minute duration from the spec
+locust -f locustfile.py --host "http://$ALB_DNS" --headless -u 10000 -r 200 --run-time 10m --csv stage-5000
+```
+
+While a stage runs, watch (in separate terminals) whether Auto Scaling is actually reacting, and where the bottleneck moves to as load increases:
+
+```powershell
+# ECS desired vs. running task count, updated every few seconds
+while ($true) {
+  aws ecs describe-services --cluster $CLUSTER --services $SERVICE `
+    --query "services[0].{desired:desiredCount,running:runningCount}"
+  Start-Sleep -Seconds 10
+}
+```
+
+* **CloudWatch → Container Insights**: per-task/service CPU and memory.
+* **CloudWatch → Alarms**: `*-ecs-cpu-high` / `*-ecs-memory-high` (app tier) vs. the new `*-rds-cpu-high` / `*-rds-connections-high` (DB tier) — per ADR-003, expect the DB-tier alarms to start firing before app scaling alone can fix things.
+* **Locust's own output** (or the `stage-*_stats.csv` files): p50/p95 latency, requests/sec actually achieved, and error rate per stage.
+
+Record latency, throughput, CPU/memory, error rate, and DB connection count for each stage — that comparison is the actual deliverable of V2's "Experiment" section in the learning project spec.
+
+## 7. Wire up GitHub Actions CI/CD
 
 In the GitHub repo: **Settings → Secrets and variables → Actions → Variables**, add:
 
@@ -112,7 +160,7 @@ In the GitHub repo: **Settings → Secrets and variables → Actions → Variabl
 
 No AWS access keys are stored in GitHub — [.github/workflows/deploy.yml](../.github/workflows/deploy.yml) assumes `AWS_ROLE_ARN` via GitHub's OIDC token. From now on, pushes to `main` touching `app/**`/`Dockerfile` automatically build, push, and redeploy.
 
-## 7. Cost control: tear it down when you're done
+## 8. Cost control: tear it down when you're done
 
 Per the learning project's "deploy → test → destroy" principle (avoid paying for idle ALB/NAT/RDS between sessions):
 
@@ -121,7 +169,7 @@ cd infra/environments/dev
 terraform destroy
 ```
 
-Leave the `infra/bootstrap` state bucket/lock table in place (they cost effectively nothing) so you don't have to redo step 1 next time. Re-running steps 3-6 later recreates everything from the same Terraform code.
+Leave the `infra/bootstrap` state bucket/lock table in place (they cost effectively nothing) so you don't have to redo step 1 next time. Re-running steps 3-7 later recreates everything from the same Terraform code.
 
 ## Troubleshooting
 
