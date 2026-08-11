@@ -9,3 +9,5 @@ redis>=5.0,<6.0
 python-dotenv>=1.0,<2.0
 pytest>=8.0,<9.0
 httpx>=0.27,<1.0
+boto3>=1.34,<2.0
+moto[sqs]>=5.0,<6.0

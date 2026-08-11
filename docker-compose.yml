@@ -25,6 +25,23 @@ services:
       timeout: 5s
       retries: 10
 
+  # V4 (Asynchronous Processing): a real SQS API running locally, so
+  # app/core/queue.py and app/worker.py use the exact same boto3 calls here
+  # and against real AWS SQS -- see docs/adr/ADR-005-async-processing.md.
+  localstack:
+    image: localstack/localstack:3
+    environment:
+      SERVICES: sqs
+    ports:
+      - "4566:4566"
+    volumes:
+      - ./infra/localstack/create-queues.sh:/etc/localstack/init/ready.d/create-queues.sh
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   app:
     build: .
     environment:
@@ -34,12 +51,41 @@ services:
       REDIS_URL: redis://redis:6379/0
       CACHE_TTL_SECONDS: 15
       CACHE_ENABLED: "true"
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SQS_ENDPOINT_URL: http://localstack:4566
     ports:
       - "8000:8000"
     depends_on:
       db:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+
+  # V4: the order-events consumer. No Postgres dependency -- every handler
+  # it dispatches to (notification/email/analytics/search) is a log-only
+  # stub, so the worker only needs the queue (SQS/LocalStack) and Redis
+  # (for the idempotency guard, itself best-effort). Scale it to see the
+  # backpressure experiment drain faster:
+  #   docker compose up -d --scale worker=3 worker
+  worker:
+    build: .
+    command: python -m app.worker
+    environment:
+      APP_NAME: CommerceOps AI Platform
+      ENVIRONMENT: local
+      REDIS_URL: redis://redis:6379/0
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SQS_ENDPOINT_URL: http://localstack:4566
+    depends_on:
+      redis:
+        condition: service_healthy
+      localstack:
         condition: service_healthy
 
 volumes:

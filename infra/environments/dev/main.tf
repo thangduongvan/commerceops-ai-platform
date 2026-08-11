@@ -72,6 +72,15 @@ module "elasticache" {
   tags               = local.tags
 }
 
+module "sqs" {
+  source = "../../modules/sqs"
+
+  name                       = local.name
+  visibility_timeout_seconds = var.sqs_visibility_timeout_seconds
+  max_receive_count          = var.sqs_max_receive_count
+  tags                       = local.tags
+}
+
 module "iam" {
   source = "../../modules/iam"
 
@@ -79,6 +88,7 @@ module "iam" {
   region                = var.region
   rds_secret_arn        = module.rds.master_user_secret_arn
   app_assets_bucket_arn = module.s3.app_assets_bucket_arn
+  sqs_queue_arn         = module.sqs.queue_arn
   ecr_repository_arn    = module.ecr.repository_arn
   ecs_cluster_name      = local.ecs_cluster_name
   ecs_service_name      = local.ecs_service_name
@@ -109,6 +119,7 @@ module "cloudwatch" {
   target_group_arn_suffix = module.alb.target_group_arn_suffix
   rds_instance_identifier = module.rds.identifier
   redis_cluster_id        = module.elasticache.cluster_id
+  dlq_name                = module.sqs.dlq_name
   alarm_email             = var.alarm_email
   tags                    = local.tags
 }
@@ -137,7 +148,13 @@ module "ecs" {
   redis_port         = module.elasticache.port
   cache_ttl_seconds  = var.cache_ttl_seconds
   cache_enabled      = var.cache_enabled
-  tags               = local.tags
+
+  sqs_queue_name           = module.sqs.queue_name
+  worker_task_role_arn     = module.iam.ecs_worker_task_role_arn
+  worker_security_group_id = module.security_groups.worker_sg_id
+  worker_desired_count     = var.worker_desired_count
+
+  tags = local.tags
 }
 
 module "autoscaling" {
@@ -153,6 +170,12 @@ module "autoscaling" {
   request_count_target_value = var.ecs_request_count_target_value
   alb_arn_suffix             = module.alb.arn_suffix
   target_group_arn_suffix    = module.alb.target_group_arn_suffix
+
+  worker_ecs_service_name = module.ecs.worker_service_name
+  sqs_queue_name          = module.sqs.queue_name
+  sns_topic_arn           = module.cloudwatch.sns_topic_arn
+  worker_min_capacity     = var.worker_min_capacity
+  worker_max_capacity     = var.worker_max_capacity
 
   depends_on = [module.ecs]
 }

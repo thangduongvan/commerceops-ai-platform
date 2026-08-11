@@ -44,3 +44,12 @@ output "redis_endpoint" {
   description = "ElastiCache Redis endpoint (host:port)"
   value       = "${module.elasticache.address}:${module.elasticache.port}"
 }
+
+output "sqs_queue_name" {
+  description = "Name of the order-events queue (app/worker resolve this to a URL via get_queue_url at runtime)"
+  value       = module.sqs.queue_name
+}
+
+output "worker_service_name" {
+  value = module.ecs.worker_service_name
+}

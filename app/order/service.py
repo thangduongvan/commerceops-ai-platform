@@ -2,8 +2,8 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.queue import publish_event
 from app.customer.models import Customer
-from app.notification.service import send_notification
 from app.order.models import Order, OrderItem, OrderStatus
 from app.order.schemas import OrderCreate
 from app.payment import service as payment_service
@@ -71,7 +71,10 @@ def create_order(db: Session, payload: OrderCreate) -> Order:
     db.commit()
     db.refresh(order)
 
-    send_notification(
+    # V4 (Asynchronous Processing): publish, don't call notification/analytics/
+    # email/search in-process. app/worker.py fans this one event out to all
+    # four side effects off the request path — see docs/adr/ADR-005-async-processing.md.
+    publish_event(
         "OrderCreated",
         {"order_id": order.id, "customer_id": order.customer_id, "total_amount": order.total_amount},
     )
@@ -82,7 +85,7 @@ def create_order(db: Session, payload: OrderCreate) -> Order:
 
     if payment_result.status == "SUCCESS":
         order.status = OrderStatus.PAID.value
-        send_notification(
+        publish_event(
             "OrderPaid",
             {"order_id": order.id, "transaction_id": payment_result.transaction_id},
         )
@@ -92,7 +95,7 @@ def create_order(db: Session, payload: OrderCreate) -> Order:
         # Saga/compensation pattern introduced properly at V12.
         _restock(db, order)
         order.status = OrderStatus.PAYMENT_FAILED.value
-        send_notification("OrderPaymentFailed", {"order_id": order.id})
+        publish_event("OrderPaymentFailed", {"order_id": order.id})
 
     db.commit()
     db.refresh(order)
@@ -128,5 +131,5 @@ def cancel_order(db: Session, order_id: int) -> Order:
     db.commit()
     db.refresh(order)
 
-    send_notification("OrderCancelled", {"order_id": order.id})
+    publish_event("OrderCancelled", {"order_id": order.id})
     return order

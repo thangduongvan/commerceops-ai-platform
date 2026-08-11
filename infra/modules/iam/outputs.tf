@@ -6,6 +6,10 @@ output "ecs_task_role_arn" {
   value = aws_iam_role.ecs_task.arn
 }
 
+output "ecs_worker_task_role_arn" {
+  value = aws_iam_role.ecs_worker_task.arn
+}
+
 output "github_actions_role_arn" {
   value = aws_iam_role.github_actions.arn
 }

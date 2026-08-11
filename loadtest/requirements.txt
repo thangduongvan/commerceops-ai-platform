@@ -1,3 +1,7 @@
 # V2 (Horizontal Scaling) load-testing tool. Kept separate from the app's own
 # requirements.txt so the production image never ships a load-test dependency.
 locust>=2.29,<3.0
+
+# V4 (Asynchronous Processing): queue_experiment.py talks to SQS/LocalStack
+# directly (not via the app's HTTP API), so it needs boto3 too.
+boto3>=1.34,<2.0

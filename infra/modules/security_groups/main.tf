@@ -73,7 +73,7 @@ resource "aws_security_group" "rds" {
 
 resource "aws_security_group" "redis" {
   name        = "${var.name}-redis-sg"
-  description = "Allow inbound Redis from ECS tasks only"
+  description = "Allow inbound Redis from ECS tasks and the worker only"
   vpc_id      = var.vpc_id
 
   ingress {
@@ -84,6 +84,16 @@ resource "aws_security_group" "redis" {
     security_groups = [aws_security_group.ecs.id]
   }
 
+  # V4: the worker task also reads Redis directly (app/core/cache.py's
+  # mark_event_processed idempotency guard), so it needs the same access.
+  ingress {
+    description     = "Redis from the worker"
+    from_port       = var.redis_port
+    to_port         = var.redis_port
+    protocol        = "tcp"
+    security_groups = [aws_security_group.worker.id]
+  }
+
   egress {
     from_port   = 0
     to_port     = 0
@@ -92,4 +102,24 @@ resource "aws_security_group" "redis" {
   }
 
   tags = merge(var.tags, { Name = "${var.name}-redis-sg" })
+}
+
+### V4: the worker (app/worker.py) never accepts inbound traffic at all —
+### it only calls out to SQS and Redis — so it gets no ingress rules
+### whatsoever, unlike every other tier above. A cheap, explicit
+### illustration that not every compute tier needs an open inbound port.
+
+resource "aws_security_group" "worker" {
+  name        = "${var.name}-worker-sg"
+  description = "Worker task: no inbound traffic accepted, egress only (SQS, Redis)"
+  vpc_id      = var.vpc_id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(var.tags, { Name = "${var.name}-worker-sg" })
 }

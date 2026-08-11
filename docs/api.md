@@ -39,6 +39,8 @@ Base URL (local): `http://localhost:8000`
 
 Order `status` values: `PENDING` (transient, never observed by clients) -> `PAID` or `PAYMENT_FAILED` -> (optionally) `CANCELLED`.
 
+**Asynchronous processing (V4)**: `POST /orders` and `POST /orders/{id}/cancel` still call the (synchronous, in-process) fake payment provider directly, but no longer wait on notification, analytics, email, or search-indexing side effects — those are published as events to an SQS queue and handled off the request path by a separate worker process (see [ADR-005](adr/ADR-005-async-processing.md)). A response is not a guarantee those side effects have run yet, only that the order itself was persisted (and paid/rejected).
+
 ## Payments (fake provider)
 
 | Method | Path        | Body                       | Notes                                             |

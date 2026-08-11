@@ -7,7 +7,7 @@ container, so these calls exercise the exact same failure path a dead
 Redis would hit in production.
 """
 
-from app.core.cache import _jittered_ttl, cache_delete, cache_get_json, cache_set_json
+from app.core.cache import _jittered_ttl, cache_delete, cache_get_json, cache_set_json, mark_event_processed
 
 
 def test_jittered_ttl_stays_within_plus_minus_10_percent():
@@ -32,3 +32,11 @@ def test_cache_get_json_returns_none_when_redis_unreachable():
 def test_cache_set_json_and_cache_delete_do_not_raise_when_redis_unreachable():
     cache_set_json("some-key", {"a": 1}, ttl_seconds=10)
     cache_delete("some-key")
+
+
+def test_mark_event_processed_fails_open_when_redis_unreachable():
+    # V4: an unreachable Redis must not stop app/worker.py from making
+    # progress -- it just means the dedup guard can't do its job, so this
+    # degrades to "treat it as not a duplicate" (at-least-once semantics
+    # preserved, worst case an event's handlers run more than once).
+    assert mark_event_processed("some-event-id", ttl_seconds=60) is True

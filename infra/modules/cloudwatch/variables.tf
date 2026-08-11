@@ -66,6 +66,11 @@ variable "alarm_email" {
   default     = ""
 }
 
+variable "dlq_name" {
+  description = "Name of the order-events DLQ (V4), for the dlq_messages_present alarm"
+  type        = string
+}
+
 variable "tags" {
   type    = map(string)
   default = {}

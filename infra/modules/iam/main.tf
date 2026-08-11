@@ -62,12 +62,48 @@ data "aws_iam_policy_document" "ecs_task_app" {
       "${var.app_assets_bucket_arn}/*",
     ]
   }
+
+  # V4: the app only ever publishes (app/core/queue.py's publish_event) —
+  # it never reads or deletes messages, that's the worker's job below.
+  # Least privilege: each tier gets exactly the SQS actions it uses.
+  statement {
+    sid       = "PublishOrderEvents"
+    actions   = ["sqs:SendMessage"]
+    resources = [var.sqs_queue_arn]
+  }
 }
 
 resource "aws_iam_role_policy" "ecs_task_app" {
   name   = "${var.name}-app-assets-access"
   role   = aws_iam_role.ecs_task.id
   policy = data.aws_iam_policy_document.ecs_task_app.json
+}
+
+### --- ECS worker task role ---
+### Used by app/worker.py at runtime. Deliberately a separate role from the
+### app's task role above, scoped to only the SQS actions the consumer side
+### needs — the worker never touches the S3 app-assets bucket, and the app
+### never receives/deletes queue messages.
+
+resource "aws_iam_role" "ecs_worker_task" {
+  name               = "${var.name}-ecs-worker-task"
+  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+
+  tags = var.tags
+}
+
+data "aws_iam_policy_document" "ecs_worker_task" {
+  statement {
+    sid       = "ConsumeOrderEvents"
+    actions   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
+    resources = [var.sqs_queue_arn]
+  }
+}
+
+resource "aws_iam_role_policy" "ecs_worker_task" {
+  name   = "${var.name}-consume-order-events"
+  role   = aws_iam_role.ecs_worker_task.id
+  policy = data.aws_iam_policy_document.ecs_worker_task.json
 }
 
 ### --- GitHub Actions OIDC role (CI/CD) ---

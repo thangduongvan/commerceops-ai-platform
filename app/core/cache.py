@@ -78,3 +78,26 @@ def cache_delete(*keys: str) -> None:
         redis_client.delete(*keys)
     except redis.RedisError:
         logger.warning("cache_delete failed for keys=%s", keys, exc_info=True)
+
+
+def mark_event_processed(event_id: str, ttl_seconds: int) -> bool:
+    """V4 (Asynchronous Processing): best-effort idempotency guard for
+    app/worker.py against SQS's at-least-once delivery.
+
+    Returns True the first time a given event_id is seen (the caller should
+    process it), and False on every subsequent call within ttl_seconds (a
+    redelivery of the same message — the caller should skip it).
+
+    Fails open: if Redis is unreachable, this returns True (i.e. "not a
+    duplicate, go ahead and process it") rather than raising, so a dead
+    Redis degrades to "occasionally reprocess a duplicate event" rather
+    than "the worker stops making progress." This is the same trade-off as
+    every other helper in this module — Redis is never allowed to block
+    correctness, only to optimize it.
+    """
+    key = f"processed_event:{event_id}"
+    try:
+        return bool(redis_client.set(key, "1", nx=True, ex=ttl_seconds))
+    except redis.RedisError:
+        logger.warning("mark_event_processed failed for event_id=%s, processing anyway", event_id, exc_info=True)
+        return True

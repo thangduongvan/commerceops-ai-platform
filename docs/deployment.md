@@ -1,4 +1,4 @@
-# Deployment Guide — AWS Foundation (V1) + Horizontal Scaling (V2) + Caching (V3)
+# Deployment Guide — AWS Foundation (V1) + Horizontal Scaling (V2) + Caching (V3) + Asynchronous Processing (V4)
 
 Step-by-step commands to deploy CommerceOps to AWS (ECS/Fargate + ALB + RDS) from a Windows machine using PowerShell. All Terraform lives under [infra/](../infra/).
 
@@ -54,7 +54,7 @@ terraform plan
 terraform apply
 ```
 
-This creates the VPC, ALB, ECS cluster/service (+ Auto Scaling target/policies, per [ADR-003](adr/ADR-003-horizontal-scaling.md)), RDS instance, ElastiCache Redis cluster (per [ADR-004](adr/ADR-004-caching.md)), ECR repo, S3 buckets, IAM roles, and CloudWatch resources. **The ECS service will show 0/2 healthy tasks after this apply** — there's no image in ECR yet, so tasks can't start. That's expected; fixed in the next step.
+This creates the VPC, ALB, ECS cluster/service (+ Auto Scaling target/policies, per [ADR-003](adr/ADR-003-horizontal-scaling.md)), RDS instance, ElastiCache Redis cluster (per [ADR-004](adr/ADR-004-caching.md)), the `order-events` SQS queue + DLQ and worker ECS service (per [ADR-005](adr/ADR-005-async-processing.md)), ECR repo, S3 buckets, IAM roles, and CloudWatch resources. **The ECS service will show 0/2 healthy tasks after this apply** — there's no image in ECR yet, so tasks can't start. That's expected; fixed in the next step.
 
 Save the outputs — you'll need them below:
 
@@ -78,14 +78,16 @@ docker build -t "${ECR_REPO}:latest" .
 docker push "${ECR_REPO}:latest"
 ```
 
-Then force the service to pick it up:
+Then force the services to pick it up — both the app and the worker (V4) run the same image:
 
 ```powershell
 $CLUSTER = terraform -chdir=infra/environments/dev output -raw ecs_cluster_name
 $SERVICE = terraform -chdir=infra/environments/dev output -raw ecs_service_name
+$WORKER  = terraform -chdir=infra/environments/dev output -raw worker_service_name
 
 aws ecs update-service --cluster $CLUSTER --service $SERVICE --force-new-deployment
-aws ecs wait services-stable --cluster $CLUSTER --services $SERVICE
+aws ecs update-service --cluster $CLUSTER --service $WORKER --force-new-deployment
+aws ecs wait services-stable --cluster $CLUSTER --services $SERVICE $WORKER
 ```
 
 ## 5. Verify
@@ -199,7 +201,71 @@ docker compose start redis
 
 On AWS, the equivalent is temporarily pointing `REDIS_HOST` at an address nothing is listening on (e.g. via `terraform apply -var="redis_node_type=..."` won't do this — instead, briefly override the ECS task definition's `REDIS_HOST` env var, redeploy, confirm `/products` still returns 200, then revert) or simply stopping/deleting the ElastiCache cluster and rerunning a Locust stage against the ALB.
 
-## 8. Wire up GitHub Actions CI/CD
+## 8. V4: Asynchronous Processing
+
+Decouples order creation from Notification/Analytics/Email/Search indexing via the `order-events` SQS queue and a separate worker service — see [ADR-005](adr/ADR-005-async-processing.md) for the design and the required visibility-timeout/retry/DLQ/at-least-once/idempotency/backpressure answers.
+
+### 8.1 Local: run against LocalStack
+
+```powershell
+docker compose up --build
+```
+
+`localstack` and `worker` are new services alongside `db`/`redis`/`app` — the LocalStack init script (`infra/localstack/create-queues.sh`) creates the `order-events` queue + DLQ automatically on startup. Place an order and watch the worker's logs pick up the fan-out:
+
+```powershell
+docker compose logs -f worker
+# in another terminal:
+curl -X POST http://localhost:8000/customers -H "Content-Type: application/json" -d '{\"name\":\"Dana\",\"email\":\"dana@example.com\"}'
+curl -X POST http://localhost:8000/products -H "Content-Type: application/json" -d '{\"name\":\"Widget\",\"price\":9.99,\"stock_quantity\":10}'
+curl -X POST http://localhost:8000/orders -H "Content-Type: application/json" -d '{\"customer_id\":1,\"items\":[{\"product_id\":1,\"quantity\":1}]}'
+```
+
+The worker's log should show `notification`, `email`, `analytics`, and `search-index` lines for `OrderCreated`, then again for `OrderPaid`/`OrderPaymentFailed`.
+
+### 8.2 Backpressure experiment: produce 5,000/sec, consume ~500/sec, then scale workers
+
+```powershell
+cd loadtest
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+
+$env:AWS_REGION = "us-east-1"
+$env:AWS_ACCESS_KEY_ID = "test"
+$env:AWS_SECRET_ACCESS_KEY = "test"
+$env:SQS_ENDPOINT_URL = "http://localhost:4566"   # omit against real AWS
+
+# Terminal 1: watch the backlog grow, then shrink
+python queue_experiment.py depth --watch
+
+# Terminal 2: stop the real worker first (docker compose stop worker), then
+# run one artificially slow consumer standing in for it (~500/sec)
+python queue_experiment.py consume --delay-ms 2
+
+# Terminal 3: fire the burst
+python queue_experiment.py produce --count 5000
+```
+
+Watch terminal 1: `visible` climbs while the burst outruns the single slow consumer, then drains back toward 0 once it catches up. To see scaling fix the backlog rather than just waiting it out, stop the single slow consumer mid-drain and instead scale the real workers:
+
+```powershell
+docker compose up -d --scale worker=4 worker
+```
+
+`visible` should fall noticeably faster with 4 workers than with 1. In AWS, the equivalent is watching the `*-worker-queue-depth-high` CloudWatch alarm trigger the step-scaling policy in [infra/modules/autoscaling](../infra/modules/autoscaling) and the worker service's task count increase (`aws ecs describe-services --cluster $CLUSTER --services $WORKER --query "services[0].{desired:desiredCount,running:runningCount}"`).
+
+### 8.3 Inspecting/redriving the DLQ
+
+Locally:
+
+```powershell
+docker compose exec localstack awslocal sqs get-queue-attributes --queue-url http://localhost:4566/000000000000/commerceops-order-events-dlq --attribute-names ApproximateNumberOfMessages
+```
+
+In AWS: CloudWatch alarm `*-order-events-dlq-not-empty` fires the moment any message lands in the DLQ (per ADR-005, this means repeated failures, not just a slow consumer — worth investigating before redriving). Once the underlying issue is fixed, redrive DLQ messages back to the main queue with the SQS console's "Start DLQ redrive" action, or `aws sqs start-message-move-task`.
+
+## 9. Wire up GitHub Actions CI/CD
 
 In the GitHub repo: **Settings → Secrets and variables → Actions → Variables**, add:
 
@@ -213,7 +279,7 @@ In the GitHub repo: **Settings → Secrets and variables → Actions → Variabl
 
 No AWS access keys are stored in GitHub — [.github/workflows/deploy.yml](../.github/workflows/deploy.yml) assumes `AWS_ROLE_ARN` via GitHub's OIDC token. From now on, pushes to `main` touching `app/**`/`Dockerfile` automatically build, push, and redeploy.
 
-## 9. Cost control: tear it down when you're done
+## 10. Cost control: tear it down when you're done
 
 Per the learning project's "deploy → test → destroy" principle (avoid paying for idle ALB/NAT/RDS/ElastiCache between sessions):
 
@@ -230,3 +296,4 @@ Leave the `infra/bootstrap` state bucket/lock table in place (they cost effectiv
 * **ALB returns 503**: target group has no healthy targets yet — check ECS service events (`aws ecs describe-services --cluster ... --services ...`) and the `/health` path/port match the app's actual listen port (8000).
 * **`terraform init` backend error**: double check `backend.tf` has the exact bucket/table names from `infra/bootstrap` outputs, and that your AWS credentials can access them.
 * **Products endpoints work but seem to ignore recent writes**: check `CACHE_ENABLED` — if `true`, `GET /products` listings are only guaranteed fresh within `cache_ttl_seconds` (see [ADR-004](adr/ADR-004-caching.md)'s "how do you invalidate the cache?"). `GET /products/{id}` is invalidated immediately on update, so if that's stale too, check the app logs for `cache_get_json`/`cache_delete` warnings — likely Redis is unreachable and every request is silently falling back to Postgres.
+* **Orders succeed but the worker never logs notification/analytics/email/search lines**: check `docker compose logs app` for `publish_event failed` warnings (queue unreachable — often `localstack` not yet healthy when `app` started) and `docker compose logs localstack` for whether `create-queues.sh` actually ran (look for "V4: order-events queue + DLQ ready on LocalStack"). In AWS, check the worker task's CloudWatch logs and confirm its IAM role has `sqs:ReceiveMessage` on the queue ([ADR-005](adr/ADR-005-async-processing.md)).

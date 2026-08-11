@@ -35,6 +35,16 @@ redis_node_type   = "cache.t3.micro"
 cache_ttl_seconds = 15
 cache_enabled     = true
 
+# V4 — Asynchronous Processing: order-events SQS queue + DLQ, and the worker
+# ECS service that consumes it. Auto Scaling for the worker (queue-depth
+# step scaling, not CPU/memory) lives in infra/modules/autoscaling — see
+# ADR-005.
+sqs_visibility_timeout_seconds = 30
+sqs_max_receive_count          = 5
+worker_desired_count           = 1
+worker_min_capacity            = 1
+worker_max_capacity            = 10
+
 # Must match the repo hosting this code, or the GitHub Actions OIDC trust policy
 # will reject the workflow's token.
 github_repo   = "thangduongvan/commerceops-ai-platform"

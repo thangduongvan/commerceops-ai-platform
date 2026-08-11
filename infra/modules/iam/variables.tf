@@ -18,6 +18,11 @@ variable "app_assets_bucket_arn" {
   type        = string
 }
 
+variable "sqs_queue_arn" {
+  description = "ARN of the order-events queue (V4) — the app's task role gets SendMessage, the worker's gets Receive/Delete/GetQueueAttributes"
+  type        = string
+}
+
 variable "ecr_repository_arn" {
   description = "ARN of the ECR repository GitHub Actions may push images to"
   type        = string

@@ -176,6 +176,33 @@ resource "aws_cloudwatch_metric_alarm" "redis_evictions_high" {
   tags = var.tags
 }
 
+### V4: any message reaching the DLQ means it failed sqs_max_receive_count
+### times in a row — worth paging on immediately, since (unlike the
+### queue-depth alarms in infra/modules/autoscaling, which just trigger
+### more workers) more workers can't fix a message that's already been
+### tried and failed repeatedly. See docs/adr/ADR-005-async-processing.md.
+
+resource "aws_cloudwatch_metric_alarm" "dlq_messages_present" {
+  alarm_name          = "${var.name}-order-events-dlq-not-empty"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = 0
+  alarm_description   = "At least one message in the order-events DLQ — something is failing repeatedly, not just slow"
+  alarm_actions       = [aws_sns_topic.alarms.arn]
+  ok_actions          = [aws_sns_topic.alarms.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    QueueName = var.dlq_name
+  }
+
+  tags = var.tags
+}
+
 resource "aws_cloudwatch_metric_alarm" "alb_unhealthy_hosts" {
   alarm_name          = "${var.name}-alb-unhealthy-hosts"
   comparison_operator = "GreaterThanThreshold"

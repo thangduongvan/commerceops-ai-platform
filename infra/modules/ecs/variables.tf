@@ -103,6 +103,39 @@ variable "environment" {
   default = "aws-dev"
 }
 
+# V4 — Asynchronous Processing (see docs/adr/ADR-005-async-processing.md)
+
+variable "sqs_queue_name" {
+  description = "Name of the order-events queue, resolved to a URL at runtime via get_queue_url (see app/core/queue.py)"
+  type        = string
+}
+
+variable "worker_task_role_arn" {
+  description = "IAM role the worker task assumes (Receive/Delete/GetQueueAttributes on the order-events queue only)"
+  type        = string
+}
+
+variable "worker_security_group_id" {
+  description = "Security group for the worker task (no ingress rules at all)"
+  type        = string
+}
+
+variable "worker_desired_count" {
+  description = "Initial worker task count. Application Auto Scaling manages it afterwards, same ignore_changes pattern as the app service."
+  type        = number
+  default     = 1
+}
+
+variable "worker_cpu" {
+  type    = number
+  default = 256
+}
+
+variable "worker_memory" {
+  type    = number
+  default = 512
+}
+
 variable "tags" {
   type    = map(string)
   default = {}

@@ -9,3 +9,7 @@ output "cluster_id" {
 output "service_name" {
   value = aws_ecs_service.app.name
 }
+
+output "worker_service_name" {
+  value = aws_ecs_service.worker.name
+}

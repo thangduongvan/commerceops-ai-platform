@@ -128,6 +128,38 @@ variable "cache_enabled" {
   default     = true
 }
 
+# V4 — Asynchronous Processing (see docs/adr/ADR-005-async-processing.md)
+
+variable "sqs_visibility_timeout_seconds" {
+  description = "How long a received order-events message is hidden before becoming visible again if not deleted (SQS's own retry mechanism)"
+  type        = number
+  default     = 30
+}
+
+variable "sqs_max_receive_count" {
+  description = "Delivery attempts before a message moves to the DLQ"
+  type        = number
+  default     = 5
+}
+
+variable "worker_desired_count" {
+  description = "Initial worker task count. From this point on, queue-depth-driven Auto Scaling (infra/modules/autoscaling) manages it — same ignore_changes pattern as the app service's desired_count."
+  type        = number
+  default     = 1
+}
+
+variable "worker_min_capacity" {
+  description = "Floor for worker Auto Scaling. >= 1 so the queue is never left completely undrained."
+  type        = number
+  default     = 1
+}
+
+variable "worker_max_capacity" {
+  description = "Ceiling for worker Auto Scaling"
+  type        = number
+  default     = 10
+}
+
 variable "github_repo" {
   description = "GitHub repo allowed to deploy via OIDC, in \"owner/repo\" form"
   type        = string

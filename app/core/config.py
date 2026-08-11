@@ -60,6 +60,28 @@ class Settings(BaseSettings):
     # toggle caching off entirely via one env var, no redeploy of infra needed.
     cache_enabled: bool = True
 
+    # V4 (Asynchronous Processing): app/core/queue.py resolves a queue *name*
+    # to its URL via get_queue_url at runtime, rather than threading a
+    # pre-built URL through Terraform/Compose — the exact same call works
+    # unchanged against LocalStack and real AWS SQS. sqs_endpoint_url is the
+    # one thing that actually differs: None in AWS (default regional
+    # endpoint, auth via the ECS task role's credentials), set to LocalStack's
+    # URL locally (see docs/adr/ADR-005-async-processing.md).
+    aws_region: str = "us-east-1"
+    sqs_queue_name: str = "order-events"
+    sqs_dlq_name: str = "order-events-dlq"
+    sqs_endpoint_url: Optional[str] = None
+
+    # Must match infra/modules/sqs's queue configuration so local (LocalStack)
+    # and AWS behave the same way — see infra/localstack/create-queues.sh.
+    sqs_visibility_timeout_seconds: int = 30
+    sqs_max_receive_count: int = 5
+
+    # How long app/worker.py remembers an event_id as "already processed",
+    # to make at-least-once delivery idempotent for the duration a redelivery
+    # is realistically still possible.
+    sqs_idempotency_ttl_seconds: int = 86400
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @model_validator(mode="after")

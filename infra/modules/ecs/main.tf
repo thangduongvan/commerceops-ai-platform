@@ -44,6 +44,11 @@ resource "aws_ecs_task_definition" "app" {
         { name = "REDIS_PORT", value = tostring(var.redis_port) },
         { name = "CACHE_TTL_SECONDS", value = tostring(var.cache_ttl_seconds) },
         { name = "CACHE_ENABLED", value = tostring(var.cache_enabled) },
+        # V4 (Asynchronous Processing): no SQS_ENDPOINT_URL here — unset
+        # means boto3 talks to the real regional SQS endpoint, authenticated
+        # via this task's own IAM role (var.task_role_arn), no static keys.
+        { name = "AWS_REGION", value = var.region },
+        { name = "SQS_QUEUE_NAME", value = var.sqs_queue_name },
       ]
 
       # Only the credentials come from Secrets Manager — host/port/dbname are not
@@ -105,4 +110,75 @@ resource "aws_ecs_service" "app" {
   }
 
   tags = merge(var.tags, { Name = "${var.name}-app" })
+}
+
+### V4 (Asynchronous Processing): a second, separate ECS service running
+### app/worker.py — the order-events consumer. Same image as "app", but no
+### load_balancer block (it's not behind the ALB, doesn't accept inbound
+### traffic at all — see the worker security group) and no RDS/Secrets
+### Manager wiring (every handler it dispatches to is a log-only stub, no
+### DB access needed). Scaled independently from the API tier, driven by
+### queue depth rather than CPU/memory/request count (infra/modules/autoscaling).
+
+resource "aws_ecs_task_definition" "worker" {
+  family                   = "${var.name}-worker"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = var.worker_cpu
+  memory                   = var.worker_memory
+  execution_role_arn       = var.execution_role_arn
+  task_role_arn            = var.worker_task_role_arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "worker"
+      image     = var.image
+      essential = true
+      command   = ["python", "-m", "app.worker"]
+
+      environment = [
+        { name = "APP_NAME", value = var.app_name },
+        { name = "ENVIRONMENT", value = var.environment },
+        { name = "REDIS_HOST", value = var.redis_host },
+        { name = "REDIS_PORT", value = tostring(var.redis_port) },
+        { name = "AWS_REGION", value = var.region },
+        { name = "SQS_QUEUE_NAME", value = var.sqs_queue_name },
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = var.log_group_name
+          "awslogs-region"        = var.region
+          "awslogs-stream-prefix" = "worker"
+        }
+      }
+    }
+  ])
+
+  tags = var.tags
+}
+
+resource "aws_ecs_service" "worker" {
+  name            = "${var.name}-worker"
+  cluster         = aws_ecs_cluster.this.id
+  task_definition = aws_ecs_task_definition.worker.arn
+  desired_count   = var.worker_desired_count
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = var.private_subnet_ids
+    security_groups  = [var.worker_security_group_id]
+    assign_public_ip = false
+  }
+
+  # V4: infra/modules/autoscaling's step-scaling policies (driven by SQS
+  # queue-depth CloudWatch alarms, not CPU/memory/ALB) own desired_count
+  # after the initial apply — same drift-avoidance reasoning as the app
+  # service above.
+  lifecycle {
+    ignore_changes = [desired_count]
+  }
+
+  tags = merge(var.tags, { Name = "${var.name}-worker" })
 }
