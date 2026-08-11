@@ -39,11 +39,34 @@ cache_enabled     = true
 # ECS service that consumes it. Auto Scaling for the worker (queue-depth
 # step scaling, not CPU/memory) lives in infra/modules/autoscaling — see
 # ADR-005.
-sqs_visibility_timeout_seconds = 30
+sqs_visibility_timeout_seconds = 60
 sqs_max_receive_count          = 5
 worker_desired_count           = 1
 worker_min_capacity            = 1
 worker_max_capacity            = 10
+
+# V5 — Reliability: timeouts on every external call, exponential backoff,
+# circuit breaker, bulkhead, and durable idempotency. See ADR-006.
+#
+# The retry ladder (1s / 2s / 4s), the circuit-breaker threshold, and the
+# bulkhead size are the three numbers worth tuning per environment: together
+# they decide how long a failing dependency is tolerated before the app stops
+# calling it, and how much of the process it may consume while doing so.
+sqs_receive_wait_time_seconds = 20
+queue_max_message_age_seconds = 300
+payment_unavailable_threshold = 5
+
+payment_gateway_success_rate    = 0.8
+payment_connect_timeout_seconds = 1.0
+payment_read_timeout_seconds    = 2.0
+payment_retry_attempts          = 4
+
+circuit_breaker_failure_threshold = 5
+circuit_breaker_recovery_seconds  = 30
+payment_bulkhead_max_concurrency  = 10
+
+db_statement_timeout_seconds  = 5
+worker_handler_retry_attempts = 3
 
 # Must match the repo hosting this code, or the GitHub Actions OIDC trust policy
 # will reject the workflow's token.

@@ -39,6 +39,14 @@ class Settings(BaseSettings):
     db_pool_size: int = 5
     db_max_overflow: int = 3
 
+    # V5 (Reliability): a query with no timeout can hold a pool connection
+    # forever, so one slow statement eventually starves every request of the
+    # small pool above. statement_timeout is enforced server-side by
+    # PostgreSQL itself, which is the only place that can actually stop a
+    # query already running — see docs/adr/ADR-006-reliability.md.
+    db_connect_timeout_seconds: int = 5
+    db_statement_timeout_seconds: int = 5
+
     # V3 (Caching): same "assemble from parts" pattern as the database URL
     # above. ECS injects REDIS_HOST/REDIS_PORT as plain (non-secret) env vars
     # — Redis has no AUTH/TLS in this setup, see docs/adr/ADR-004-caching.md.
@@ -74,13 +82,79 @@ class Settings(BaseSettings):
 
     # Must match infra/modules/sqs's queue configuration so local (LocalStack)
     # and AWS behave the same way — see infra/localstack/create-queues.sh.
-    sqs_visibility_timeout_seconds: int = 30
+    #
+    # V5 raised this from 30s to 60s: app/worker.py now retries each handler
+    # in-process with backoff, and that retry budget has to fit inside the
+    # visibility window. Otherwise SQS makes the message visible again while
+    # the first worker is still retrying it, and a *second* worker starts
+    # processing the same event concurrently.
+    sqs_visibility_timeout_seconds: int = 60
     sqs_max_receive_count: int = 5
 
     # How long app/worker.py remembers an event_id as "already processed",
     # to make at-least-once delivery idempotent for the duration a redelivery
-    # is realistically still possible.
+    # is realistically still possible. V5: this is now the TTL of the Redis
+    # *cache* in front of the authoritative processed_events table, not the
+    # dedup record itself (app/core/idempotency.py).
     sqs_idempotency_ttl_seconds: int = 86400
+
+    # V5 (Reliability): boto3's own retries are disabled in favour of the
+    # explicit, logged, jittered retries in app/core/reliability.py — two
+    # independent retry layers multiply load and make the real attempt count
+    # invisible. read_timeout only applies to the producer's short calls;
+    # app/worker.py builds its own client with a longer read_timeout because
+    # a 20-second long poll would otherwise time out on every single receive.
+    sqs_connect_timeout_seconds: int = 3
+    sqs_read_timeout_seconds: int = 5
+    sqs_publish_retry_attempts: int = 3
+
+    # V5: the order-events publish is no longer single-shot. It stays
+    # best-effort (never fails the order), but a transient blip now costs a
+    # few hundred milliseconds of retry instead of silently losing that
+    # order's side effects.
+    publish_retry_base_delay_seconds: float = 0.1
+
+    # V5 (Reliability) — payment gateway. In AWS the fake gateway runs as a
+    # sidecar in the same task, so this is localhost; under Docker Compose
+    # it's a separate service by name. Only this URL differs between the two,
+    # the same "one env var differs" shape as SQS_ENDPOINT_URL above.
+    payment_gateway_url: str = "http://payment-gateway:9000"
+
+    # Split connect/read timeouts, because they fail for different reasons:
+    # connect failing fast means "nothing is listening", read timing out
+    # means "it accepted the request and then didn't answer" — the ambiguous
+    # case where the charge may actually have gone through.
+    payment_connect_timeout_seconds: float = 1.0
+    payment_read_timeout_seconds: float = 2.0
+
+    # attempts=4 with base=1.0/multiplier=2/max=8.0 produces the V5 spec's
+    # exact 1s / 2s / 4s ladder between four attempts.
+    payment_retry_attempts: int = 4
+    retry_base_delay_seconds: float = 1.0
+    retry_multiplier: float = 2.0
+    retry_max_delay_seconds: float = 8.0
+
+    circuit_breaker_failure_threshold: int = 5
+    circuit_breaker_recovery_seconds: float = 30.0
+
+    # Roughly a quarter of FastAPI's default 40-thread pool: enough
+    # concurrency for normal order volume, low enough that a hanging gateway
+    # can never consume every thread and take product reads down with it.
+    payment_bulkhead_max_concurrency: int = 10
+    payment_bulkhead_acquire_timeout_seconds: float = 0.5
+
+    # V5: per-handler retry inside app/worker.py. Deliberately a *smaller*
+    # budget than the payment ladder above — the whole ladder must fit inside
+    # sqs_visibility_timeout_seconds alongside the handlers' own runtime, and
+    # SQS redelivery already provides the slow, long-horizon retries.
+    worker_handler_retry_attempts: int = 3
+    worker_handler_retry_base_delay_seconds: float = 0.5
+    worker_handler_retry_max_delay_seconds: float = 2.0
+
+    # How long one worker's claim on an event lasts. Sized to the visibility
+    # timeout: the lease should expire at roughly the moment SQS would let
+    # another worker receive the same message anyway.
+    idempotency_lease_ttl_seconds: int = 60
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

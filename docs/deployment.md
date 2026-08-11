@@ -1,4 +1,4 @@
-# Deployment Guide — AWS Foundation (V1) + Horizontal Scaling (V2) + Caching (V3) + Asynchronous Processing (V4)
+# Deployment Guide — AWS Foundation (V1) + Horizontal Scaling (V2) + Caching (V3) + Asynchronous Processing (V4) + Reliability (V5)
 
 Step-by-step commands to deploy CommerceOps to AWS (ECS/Fargate + ALB + RDS) from a Windows machine using PowerShell. All Terraform lives under [infra/](../infra/).
 
@@ -265,7 +265,139 @@ docker compose exec localstack awslocal sqs get-queue-attributes --queue-url htt
 
 In AWS: CloudWatch alarm `*-order-events-dlq-not-empty` fires the moment any message lands in the DLQ (per ADR-005, this means repeated failures, not just a slow consumer — worth investigating before redriving). Once the underlying issue is fixed, redrive DLQ messages back to the main queue with the SQS console's "Start DLQ redrive" action, or `aws sqs start-message-move-task`.
 
-## 9. Wire up GitHub Actions CI/CD
+V5 adds a CLI that works identically against LocalStack and real SQS — see §9.6.
+
+## 9. V5: Reliability
+
+Injects the four faults the spec names — payment timeout, 50% API failure, consumer crash, duplicate event — and verifies the system survives each. See [ADR-006](adr/ADR-006-reliability.md) for the design and the required retry/timeout/DLQ/idempotency/circuit-breaker/bulkhead answers.
+
+Everything here is driven by [loadtest/chaos_experiment.py](../loadtest/chaos_experiment.py), which sets up its own test data and prints each scenario's expected outcome before measuring the actual one.
+
+### 9.1 Local setup
+
+```powershell
+docker compose up --build
+```
+
+`payment-gateway` is the new service (port 9000): a stand-in third-party gateway in its own process, so timeouts and connection failures are real rather than simulated in-process. `worker` also gained a Postgres dependency in V5 — it writes the `processed_events` table.
+
+```powershell
+cd loadtest
+.venv\Scripts\activate
+pip install -r requirements.txt
+
+$env:APP_URL = "http://localhost:8000"
+$env:GATEWAY_URL = "http://localhost:9000"
+$env:AWS_REGION = "us-east-1"
+$env:AWS_ACCESS_KEY_ID = "test"
+$env:AWS_SECRET_ACCESS_KEY = "test"
+$env:SQS_ENDPOINT_URL = "http://localhost:4566"   # omit against real AWS
+
+python chaos_experiment.py all      # or one scenario at a time, below
+```
+
+### 9.2 Payment timeout
+
+```powershell
+python chaos_experiment.py timeout
+```
+
+Makes the gateway hang for 10s on every request, well past the client's 2s read timeout.
+
+**Expect**: orders come back `PAYMENT_PENDING`, *not* `PAYMENT_FAILED` — the gateway accepted the request and went quiet, so whether the card was charged is genuinely unknown. Stock is **not** released (releasing inventory for a possibly-paid order is the worse error; see ADR-006 §6). The first few orders take ~7s each as the retry ladder plays out; after five consecutive failures the circuit opens and the rest return almost instantly. That drop in latency *is* the circuit breaker working.
+
+To watch it by hand instead:
+
+```powershell
+curl -X POST http://localhost:9000/admin/chaos -H "Content-Type: application/json" -d '{\"hang_rate\":1.0,\"hang_ms\":10000}'
+curl http://localhost:8000/health/ready        # payment_gateway.circuit_state
+docker compose logs app | Select-String "circuit_breaker|payment_gateway_unavailable"
+curl -X POST http://localhost:9000/admin/reset
+```
+
+### 9.3 50% API failure
+
+```powershell
+python chaos_experiment.py failure
+```
+
+Makes the gateway return 503 to half of all requests.
+
+**Expect**: clearly *more* than half the orders end up `PAID`. This is the point — a per-request failure rate is not an order failure rate, because a 503 is retried (unlike a decline, which is a business answer and never retried). Latency rises where retries happened. `GET /admin/charges` on the gateway confirms the charge count matches the order count, not the attempt count.
+
+### 9.4 Consumer crash
+
+```powershell
+python chaos_experiment.py crash
+```
+
+Publishes 200 events, `docker compose kill`s the worker mid-drain (SIGKILL, no graceful shutdown), then restarts it.
+
+**Expect**: no event loss. Messages the worker was holding show up as `in_flight` immediately after the kill, become visible again once the 60s visibility timeout expires, and are processed by the restarted worker. The queue drains to zero. A slow drain here is the visibility timeout, not loss.
+
+### 9.5 Duplicate event
+
+```powershell
+python chaos_experiment.py duplicate
+```
+
+Publishes the identical `event_id` twice.
+
+**Expect**: exactly one set of business effects. The second delivery finds durable `processed_events` rows and logs `resuming, handlers already done`. Verify directly:
+
+```powershell
+docker compose logs worker | Select-String "<event_id from the script output>"
+docker compose exec db psql -U commerceops -d commerceops -c "SELECT event_id, handler_name FROM processed_events ORDER BY processed_at DESC LIMIT 8;"
+```
+
+Four rows per event — one per handler — is the shape that makes partial failure recoverable: a redelivery re-runs only the handlers that are missing.
+
+### 9.6 Failure isolation (bulkhead)
+
+```powershell
+python chaos_experiment.py isolation
+```
+
+Hangs the gateway for 30s while hammering `POST /orders` with 30 concurrent requests, and simultaneously polls `GET /products`.
+
+**Expect**: product reads stay fast (p50 in milliseconds) throughout, and some orders are shed immediately with `bulkhead_full` or `circuit_open` rather than queueing. Without the bulkhead, 30 hanging order requests would hold most of FastAPI's ~40-thread pool and product reads — which touch nothing but Redis and Postgres — would start timing out behind a dependency they never use.
+
+### 9.7 DLQ inspection and redrive
+
+```powershell
+python -m app.dlq inspect              # depth + a sample of bodies, consumes nothing
+python -m app.dlq redrive --max 10     # send back to the main queue, in batches
+python -m app.dlq purge --yes          # give up on them (unrecoverable)
+```
+
+Redrive only *after* fixing whatever made the messages fail — a message that failed five times will fail five more and land straight back in the DLQ. Run it in batches so a dependency that has only just recovered isn't knocked over by the whole backlog at once.
+
+Against AWS, drop `SQS_ENDPOINT_URL` and set `SQS_QUEUE_NAME`/`SQS_DLQ_NAME` from the Terraform outputs:
+
+```powershell
+$env:SQS_QUEUE_NAME = terraform -chdir=infra/environments/dev output -raw sqs_queue_name
+$env:SQS_DLQ_NAME = terraform -chdir=infra/environments/dev output -raw sqs_dlq_name
+```
+
+### 9.8 The same experiments against AWS
+
+Point `APP_URL` at the ALB and skip `SQS_ENDPOINT_URL`. `GATEWAY_URL` is the one thing that isn't reachable: the gateway runs as a sidecar on the task's `localhost`, with no ALB route. Two options:
+
+* **Chaos via env vars**: set `GATEWAY_HANG_RATE` / `GATEWAY_ERROR_RATE` on the `payment-gateway` container in the task definition and redeploy. Blunter than the admin endpoint (a redeploy per change), but no public surface on a fault-injection endpoint.
+* **Kill the sidecar**: `aws ecs execute-command` into the task and stop the gateway process. This is why the sidecar is `essential = false` — killing it must not make ECS tear down the whole task. The app should keep serving reads while orders go `PAYMENT_PENDING`.
+
+The reliability alarms to watch in the CloudWatch console while doing this ([infra/modules/cloudwatch](../infra/modules/cloudwatch)):
+
+| Alarm | Fires when |
+|---|---|
+| `*-circuit-breaker-open` | A breaker opened — the app has stopped calling a dependency |
+| `*-payment-gateway-unavailable` | Orders are completing without a payment answer (`PAYMENT_PENDING` piling up) |
+| `*-order-events-oldest-message-age-high` | The queue is *stuck*, not merely busy — adding workers won't help |
+| `*-order-events-dlq-not-empty` | Messages have failed repeatedly (V4) |
+
+The first two are log-metric-filter alarms, because an open circuit is invisible to infrastructure metrics: the task is healthy, CPU is low, and the ALB sees 200s.
+
+## 10. Wire up GitHub Actions CI/CD
 
 In the GitHub repo: **Settings → Secrets and variables → Actions → Variables**, add:
 
@@ -279,7 +411,7 @@ In the GitHub repo: **Settings → Secrets and variables → Actions → Variabl
 
 No AWS access keys are stored in GitHub — [.github/workflows/deploy.yml](../.github/workflows/deploy.yml) assumes `AWS_ROLE_ARN` via GitHub's OIDC token. From now on, pushes to `main` touching `app/**`/`Dockerfile` automatically build, push, and redeploy.
 
-## 10. Cost control: tear it down when you're done
+## 11. Cost control: tear it down when you're done
 
 Per the learning project's "deploy → test → destroy" principle (avoid paying for idle ALB/NAT/RDS/ElastiCache between sessions):
 
@@ -288,7 +420,7 @@ cd infra/environments/dev
 terraform destroy
 ```
 
-Leave the `infra/bootstrap` state bucket/lock table in place (they cost effectively nothing) so you don't have to redo step 1 next time. Re-running steps 3-8 later recreates everything from the same Terraform code.
+Leave the `infra/bootstrap` state bucket/lock table in place (they cost effectively nothing) so you don't have to redo step 1 next time. Re-running steps 3–9 later recreates everything from the same Terraform code.
 
 ## Troubleshooting
 
@@ -296,4 +428,8 @@ Leave the `infra/bootstrap` state bucket/lock table in place (they cost effectiv
 * **ALB returns 503**: target group has no healthy targets yet — check ECS service events (`aws ecs describe-services --cluster ... --services ...`) and the `/health` path/port match the app's actual listen port (8000).
 * **`terraform init` backend error**: double check `backend.tf` has the exact bucket/table names from `infra/bootstrap` outputs, and that your AWS credentials can access them.
 * **Products endpoints work but seem to ignore recent writes**: check `CACHE_ENABLED` — if `true`, `GET /products` listings are only guaranteed fresh within `cache_ttl_seconds` (see [ADR-004](adr/ADR-004-caching.md)'s "how do you invalidate the cache?"). `GET /products/{id}` is invalidated immediately on update, so if that's stale too, check the app logs for `cache_get_json`/`cache_delete` warnings — likely Redis is unreachable and every request is silently falling back to Postgres.
-* **Orders succeed but the worker never logs notification/analytics/email/search lines**: check `docker compose logs app` for `publish_event failed` warnings (queue unreachable — often `localstack` not yet healthy when `app` started) and `docker compose logs localstack` for whether `create-queues.sh` actually ran (look for "V4: order-events queue + DLQ ready on LocalStack"). In AWS, check the worker task's CloudWatch logs and confirm its IAM role has `sqs:ReceiveMessage` on the queue ([ADR-005](adr/ADR-005-async-processing.md)).
+* **Orders succeed but the worker never logs notification/analytics/email/search lines**: check `docker compose logs app` for `publish_event failed` warnings (queue unreachable — often `localstack` not yet healthy when `app` started) and `docker compose logs localstack` for whether `create-queues.sh` actually ran (look for "V4/V5: order-events queue + DLQ ready on LocalStack"). In AWS, check the worker task's CloudWatch logs and confirm its IAM role has `sqs:ReceiveMessage` **and `sqs:GetQueueUrl`** on the queue — the worker resolves the queue name to a URL at runtime, so a policy missing `GetQueueUrl` fails only in AWS, since LocalStack doesn't enforce IAM ([ADR-006](adr/ADR-006-reliability.md)).
+* **Every order comes back `PAYMENT_PENDING` (V5)**: the app can't reach the payment gateway at all. Check `curl http://localhost:8000/health/ready` — `payment_gateway.reachable` will be `false`. Locally that usually means `PAYMENT_GATEWAY_URL` still points at `payment-gateway:9000` while the app is running outside Compose (use `localhost:9000`); in AWS, check the sidecar's `payment-gateway` log stream. If `reachable` is `true` but `circuit_state` is `OPEN`, the breaker is deliberately refusing calls and will probe again after 30s.
+* **Orders return `PAYMENT_PENDING` with `reason: bulkhead_full` under load (V5)**: expected behaviour, not a bug — the payment gateway is slow enough that 10 calls are already in flight, so further orders are shed to protect the rest of the app. If it happens without the gateway being slow, `PAYMENT_BULKHEAD_MAX_CONCURRENCY` is set too low for the traffic.
+* **The worker stops making progress and logs database errors (V5)**: V5 gave the worker a Postgres dependency (`processed_events`), which V4 didn't have. Locally, make sure `db` is running and `DATABASE_URL` is set on the worker service. In AWS, confirm the RDS security group allows ingress from the *worker* security group, not just the app's ([infra/modules/security_groups](../infra/modules/security_groups)).
+* **A message is redelivered while a worker is still processing it (V5)**: the visibility timeout is shorter than the worker's retry budget. `SQS_VISIBILITY_TIMEOUT_SECONDS` (60s), the queue's actual `VisibilityTimeout`, and `infra/localstack/create-queues.sh` all have to agree — check with `awslocal sqs get-queue-attributes --attribute-names VisibilityTimeout`.

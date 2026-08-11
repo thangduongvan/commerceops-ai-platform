@@ -7,7 +7,14 @@ container, so these calls exercise the exact same failure path a dead
 Redis would hit in production.
 """
 
-from app.core.cache import _jittered_ttl, cache_delete, cache_get_json, cache_set_json, mark_event_processed
+from app.core.cache import (
+    _jittered_ttl,
+    cache_delete,
+    cache_get_json,
+    cache_ping,
+    cache_set_if_absent,
+    cache_set_json,
+)
 
 
 def test_jittered_ttl_stays_within_plus_minus_10_percent():
@@ -34,9 +41,17 @@ def test_cache_set_json_and_cache_delete_do_not_raise_when_redis_unreachable():
     cache_delete("some-key")
 
 
-def test_mark_event_processed_fails_open_when_redis_unreachable():
-    # V4: an unreachable Redis must not stop app/worker.py from making
-    # progress -- it just means the dedup guard can't do its job, so this
-    # degrades to "treat it as not a duplicate" (at-least-once semantics
-    # preserved, worst case an event's handlers run more than once).
-    assert mark_event_processed("some-event-id", ttl_seconds=60) is True
+def test_cache_set_if_absent_fails_open_when_redis_unreachable():
+    # An unreachable Redis must not stop app/worker.py from making progress. V4
+    # used this as its entire dedup guard, which meant failing open also meant
+    # failing to deduplicate. V5 demoted it to an in-flight lease
+    # (app/core/idempotency.py) and moved the authoritative record to Postgres,
+    # so failing open now costs at most some duplicated *work* -- duplicate
+    # business effects are prevented by the durable records instead.
+    assert cache_set_if_absent("some-lease-key", ttl_seconds=60) is True
+
+
+def test_cache_ping_reports_false_when_redis_unreachable():
+    # V5: used by the deep /health/ready probe, which must report Redis being
+    # down rather than raising and taking the health endpoint down with it.
+    assert cache_ping() is False

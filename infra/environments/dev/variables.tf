@@ -131,9 +131,9 @@ variable "cache_enabled" {
 # V4 — Asynchronous Processing (see docs/adr/ADR-005-async-processing.md)
 
 variable "sqs_visibility_timeout_seconds" {
-  description = "How long a received order-events message is hidden before becoming visible again if not deleted (SQS's own retry mechanism)"
+  description = "How long a received order-events message is hidden before becoming visible again if not deleted (SQS's own retry mechanism). V5 raised this from 30s: the worker's in-process retry ladder must fit inside the window, or the message is redelivered to a second worker mid-retry."
   type        = number
-  default     = 30
+  default     = 60
 }
 
 variable "sqs_max_receive_count" {
@@ -175,4 +175,78 @@ variable "alarm_email" {
   description = "Email to notify on CloudWatch alarms. Leave empty to skip the subscription."
   type        = string
   default     = ""
+}
+
+# V5 — Reliability (see docs/adr/ADR-006-reliability.md)
+
+variable "sqs_receive_wait_time_seconds" {
+  description = "Queue-level long polling, so a consumer that omits WaitTimeSeconds still waits instead of returning empty in a tight loop"
+  type        = number
+  default     = 20
+}
+
+variable "queue_max_message_age_seconds" {
+  description = "Age of the oldest order-events message above which the queue is stuck rather than busy. Unlike depth, adding workers cannot fix this, so it pages instead of scaling."
+  type        = number
+  default     = 300
+}
+
+variable "payment_unavailable_threshold" {
+  description = "Orders per minute finishing without a payment answer (PAYMENT_PENDING) before alarming"
+  type        = number
+  default     = 5
+}
+
+variable "payment_gateway_success_rate" {
+  description = "Fraction of charges the stand-in gateway approves under normal conditions. Fault injection happens at runtime via its /admin/chaos endpoint (loadtest/chaos_experiment.py), not here."
+  type        = number
+  default     = 0.8
+}
+
+variable "payment_connect_timeout_seconds" {
+  description = "TCP connect timeout on the payment gateway call. A connect failure means nothing is listening — unambiguous, and safe to retry."
+  type        = number
+  default     = 1.0
+}
+
+variable "payment_read_timeout_seconds" {
+  description = "How long to wait for the gateway's answer. Exceeding it yields an UNKNOWN outcome (the charge may have happened), not a failure — see PAYMENT_PENDING in app/order/models.py."
+  type        = number
+  default     = 2.0
+}
+
+variable "payment_retry_attempts" {
+  description = "Total attempts per charge. 4, with base 1.0s and multiplier 2.0, is the 1s / 2s / 4s ladder the V5 spec asks for."
+  type        = number
+  default     = 4
+}
+
+variable "circuit_breaker_failure_threshold" {
+  description = "Consecutive failures before the payment circuit opens and calls fail fast instead of each paying the full retry budget"
+  type        = number
+  default     = 5
+}
+
+variable "circuit_breaker_recovery_seconds" {
+  description = "How long the circuit stays open before admitting a single trial call"
+  type        = number
+  default     = 30
+}
+
+variable "payment_bulkhead_max_concurrency" {
+  description = "Cap on concurrent gateway calls. Roughly a quarter of FastAPI's default thread pool, so a hanging gateway can never consume every thread and take product reads down with it."
+  type        = number
+  default     = 10
+}
+
+variable "db_statement_timeout_seconds" {
+  description = "Server-side PostgreSQL statement_timeout. pool_pre_ping detects a dead connection; only this stops a query that connected fine and then ran forever holding a pool slot."
+  type        = number
+  default     = 5
+}
+
+variable "worker_handler_retry_attempts" {
+  description = "In-process attempts per handler in app/worker.py. Deliberately smaller than the payment ladder: the budget must fit inside the visibility timeout, and SQS redelivery already provides the slow retries."
+  type        = number
+  default     = 3
 }

@@ -66,9 +66,15 @@ data "aws_iam_policy_document" "ecs_task_app" {
   # V4: the app only ever publishes (app/core/queue.py's publish_event) —
   # it never reads or deletes messages, that's the worker's job below.
   # Least privilege: each tier gets exactly the SQS actions it uses.
+  #
+  # V5 added sqs:GetQueueUrl. Both tiers resolve a queue *name* to its URL at
+  # runtime (app/core/queue.py's resolve_queue_url) rather than being handed a
+  # pre-built URL, so that call needs authorizing too — it was missing since
+  # V4, where it would have surfaced as every publish silently failing in AWS
+  # while working perfectly against LocalStack (which doesn't check IAM).
   statement {
     sid       = "PublishOrderEvents"
-    actions   = ["sqs:SendMessage"]
+    actions   = ["sqs:SendMessage", "sqs:GetQueueUrl"]
     resources = [var.sqs_queue_arn]
   }
 }
@@ -94,9 +100,30 @@ resource "aws_iam_role" "ecs_worker_task" {
 
 data "aws_iam_policy_document" "ecs_worker_task" {
   statement {
-    sid       = "ConsumeOrderEvents"
-    actions   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
+    sid = "ConsumeOrderEvents"
+    actions = [
+      "sqs:ReceiveMessage",
+      "sqs:DeleteMessage",
+      "sqs:GetQueueAttributes",
+      "sqs:GetQueueUrl",
+      # V5: the worker extends the in-flight window before running its retry
+      # ladder, so the message isn't redelivered to a second worker mid-retry
+      # (app/worker.py's _extend_visibility).
+      "sqs:ChangeMessageVisibility",
+    ]
     resources = [var.sqs_queue_arn]
+  }
+
+  # V5: poison messages (bodies that can never parse) are sent straight to the
+  # DLQ instead of burning max_receive_count redeliveries first. Send-only —
+  # the worker never consumes from the DLQ, since draining it is a deliberate
+  # operator action (`python -m app.dlq redrive`) that must not happen
+  # automatically. A message reaches the DLQ precisely because retrying didn't
+  # work, so an automatic drain is just a slower infinite loop.
+  statement {
+    sid       = "ParkPoisonMessages"
+    actions   = ["sqs:SendMessage", "sqs:GetQueueUrl"]
+    resources = [var.sqs_dlq_arn]
   }
 }
 

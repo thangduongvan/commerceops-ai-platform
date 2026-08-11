@@ -89,10 +89,27 @@ def create_order(db: Session, payload: OrderCreate) -> Order:
             "OrderPaid",
             {"order_id": order.id, "transaction_id": payment_result.transaction_id},
         )
+    elif payment_result.status == "UNKNOWN":
+        # V5 (Reliability): the gateway never answered (timeout, retries
+        # exhausted, open circuit, shed by the bulkhead), so the charge may
+        # well have gone through.
+        #
+        # Deliberately NOT restocking here, unlike the declined branch below.
+        # Releasing stock for an order the customer may have paid for is the
+        # worse of the two errors: it can oversell inventory and leaves a
+        # paid order with nothing reserved for it. Holding stock on an
+        # unresolved order costs us availability of that stock until
+        # reconciliation resolves it — recoverable, and visible.
+        order.status = OrderStatus.PAYMENT_PENDING.value
+        publish_event(
+            "OrderPaymentUnconfirmed",
+            {"order_id": order.id, "reason": payment_result.reason},
+        )
     else:
         # Compensating action: release the stock reserved above, since the
-        # order did not actually complete. This is a small preview of the
-        # Saga/compensation pattern introduced properly at V12.
+        # order definitively did not complete — the gateway answered and
+        # declined. This is a small preview of the Saga/compensation pattern
+        # introduced properly at V12.
         _restock(db, order)
         order.status = OrderStatus.PAYMENT_FAILED.value
         publish_event("OrderPaymentFailed", {"order_id": order.id})
@@ -120,7 +137,15 @@ def list_orders(
 
 def cancel_order(db: Session, order_id: int) -> Order:
     order = get_order(db, order_id)
-    if order.status in (OrderStatus.CANCELLED.value, OrderStatus.PAYMENT_FAILED.value):
+    # V5: PAYMENT_PENDING is not cancellable either. Cancelling restocks, and
+    # restocking an order that may have been charged is precisely what the
+    # UNKNOWN branch of create_order refuses to do. It has to be reconciled
+    # against the gateway into PAID or PAYMENT_FAILED first.
+    if order.status in (
+        OrderStatus.CANCELLED.value,
+        OrderStatus.PAYMENT_FAILED.value,
+        OrderStatus.PAYMENT_PENDING.value,
+    ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Order cannot be cancelled from status {order.status}",

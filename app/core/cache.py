@@ -23,6 +23,11 @@ _pool = redis.ConnectionPool.from_url(
     max_connections=settings.redis_max_connections,
     socket_connect_timeout=settings.redis_socket_timeout_seconds,
     socket_timeout=settings.redis_socket_timeout_seconds,
+    # V5 (Reliability): explicitly no retry. Everything in this module
+    # already fails open, so a retry would only add latency to a request
+    # that is going to fall through to Postgres anyway — the fastest correct
+    # response to a Redis timeout here is to give up immediately.
+    retry_on_timeout=False,
 )
 redis_client = redis.Redis(connection_pool=_pool)
 
@@ -80,24 +85,35 @@ def cache_delete(*keys: str) -> None:
         logger.warning("cache_delete failed for keys=%s", keys, exc_info=True)
 
 
-def mark_event_processed(event_id: str, ttl_seconds: int) -> bool:
-    """V4 (Asynchronous Processing): best-effort idempotency guard for
-    app/worker.py against SQS's at-least-once delivery.
+def cache_set_if_absent(key: str, ttl_seconds: int, value: str = "1") -> bool:
+    """Atomic "claim this key if nobody else has" (Redis SET NX EX).
 
-    Returns True the first time a given event_id is seen (the caller should
-    process it), and False on every subsequent call within ttl_seconds (a
-    redelivery of the same message — the caller should skip it).
+    Returns True if this caller set the key, False if it already existed.
 
-    Fails open: if Redis is unreachable, this returns True (i.e. "not a
-    duplicate, go ahead and process it") rather than raising, so a dead
-    Redis degrades to "occasionally reprocess a duplicate event" rather
-    than "the worker stops making progress." This is the same trade-off as
-    every other helper in this module — Redis is never allowed to block
-    correctness, only to optimize it.
+    V4 introduced this as the worker's whole idempotency guard. V5 demotes it
+    to what it actually is — a best-effort, expiring *lease*, used by
+    app/core/idempotency.py to stop two workers doing the same work at the
+    same time. It is explicitly not a durable record that work was done;
+    Postgres holds that now, because a lease that can vanish (Redis restart,
+    eviction, network partition) cannot be the thing preventing a duplicate
+    charge. See docs/adr/ADR-006-reliability.md.
+
+    Fails open: if Redis is unreachable this returns True ("claim granted"),
+    so a dead Redis degrades to "two workers might duplicate some work, and
+    the authoritative store will reject the second one" rather than "the
+    worker stops making progress." Same trade-off as every other helper here.
     """
-    key = f"processed_event:{event_id}"
     try:
-        return bool(redis_client.set(key, "1", nx=True, ex=ttl_seconds))
+        return bool(redis_client.set(key, value, nx=True, ex=ttl_seconds))
     except redis.RedisError:
-        logger.warning("mark_event_processed failed for event_id=%s, processing anyway", event_id, exc_info=True)
+        logger.warning("cache_set_if_absent failed for key=%s, proceeding anyway", key, exc_info=True)
         return True
+
+
+def cache_ping() -> bool:
+    """V5: is Redis reachable right now? Used by the deep health probe in
+    app/main.py. Never raises."""
+    try:
+        return bool(redis_client.ping())
+    except redis.RedisError:
+        return False

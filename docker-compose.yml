@@ -42,6 +42,27 @@ services:
       timeout: 5s
       retries: 20
 
+  # V5 (Reliability): a stand-in third-party payment gateway behind a real
+  # HTTP boundary, so timeouts/retries/circuit breaking are exercised against
+  # something that can genuinely hang or refuse connections. Fault injection
+  # is driven at runtime via POST /admin/chaos -- see
+  # loadtest/chaos_experiment.py and docs/adr/ADR-006-reliability.md.
+  payment-gateway:
+    build: .
+    command: uvicorn fake_gateway.main:app --host 0.0.0.0 --port 9000
+    environment:
+      GATEWAY_SUCCESS_RATE: "0.8"
+      GATEWAY_ERROR_RATE: "0"
+      GATEWAY_HANG_RATE: "0"
+      GATEWAY_LATENCY_MS: "0"
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   app:
     build: .
     environment:
@@ -55,6 +76,10 @@ services:
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       SQS_ENDPOINT_URL: http://localstack:4566
+      # V5: the only value that differs from the AWS deployment, where the
+      # gateway is a sidecar in the same task and this is http://localhost:9000
+      # -- the same shape as SQS_ENDPOINT_URL above.
+      PAYMENT_GATEWAY_URL: http://payment-gateway:9000
     ports:
       - "8000:8000"
     depends_on:
@@ -64,17 +89,24 @@ services:
         condition: service_healthy
       localstack:
         condition: service_healthy
+      payment-gateway:
+        condition: service_healthy
 
-  # V4: the order-events consumer. No Postgres dependency -- every handler
-  # it dispatches to (notification/email/analytics/search) is a log-only
-  # stub, so the worker only needs the queue (SQS/LocalStack) and Redis
-  # (for the idempotency guard, itself best-effort). Scale it to see the
-  # backpressure experiment drain faster:
+  # V4: the order-events consumer. Scale it to see the backpressure
+  # experiment drain faster:
   #   docker compose up -d --scale worker=3 worker
+  #
+  # V5 (Reliability) gave it a Postgres dependency it deliberately didn't
+  # have in V4. Idempotency is no longer "best-effort Redis": the durable
+  # record that a side effect already ran lives in the processed_events
+  # table, because a Redis key that can be evicted or lost on restart cannot
+  # be the only thing standing between a retry and a duplicate business
+  # effect. Redis stays in front of it as a cache and as the in-flight lease.
   worker:
     build: .
     command: python -m app.worker
     environment:
+      DATABASE_URL: postgresql+psycopg://commerceops:commerceops@db:5432/commerceops
       APP_NAME: CommerceOps AI Platform
       ENVIRONMENT: local
       REDIS_URL: redis://redis:6379/0
@@ -83,6 +115,8 @@ services:
       AWS_SECRET_ACCESS_KEY: test
       SQS_ENDPOINT_URL: http://localstack:4566
     depends_on:
+      db:
+        condition: service_healthy
       redis:
         condition: service_healthy
       localstack:

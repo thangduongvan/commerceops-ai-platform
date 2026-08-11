@@ -19,7 +19,12 @@ variable "app_assets_bucket_arn" {
 }
 
 variable "sqs_queue_arn" {
-  description = "ARN of the order-events queue (V4) — the app's task role gets SendMessage, the worker's gets Receive/Delete/GetQueueAttributes"
+  description = "ARN of the order-events queue (V4) — the app's task role gets SendMessage, the worker's gets Receive/Delete/GetQueueAttributes/ChangeMessageVisibility"
+  type        = string
+}
+
+variable "sqs_dlq_arn" {
+  description = "ARN of the order-events DLQ (V5) — the worker gets SendMessage only, so it can park poison messages without being able to drain the DLQ automatically"
   type        = string
 }
 

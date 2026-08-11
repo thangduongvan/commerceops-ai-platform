@@ -78,6 +78,7 @@ module "sqs" {
   name                       = local.name
   visibility_timeout_seconds = var.sqs_visibility_timeout_seconds
   max_receive_count          = var.sqs_max_receive_count
+  receive_wait_time_seconds  = var.sqs_receive_wait_time_seconds
   tags                       = local.tags
 }
 
@@ -89,6 +90,7 @@ module "iam" {
   rds_secret_arn        = module.rds.master_user_secret_arn
   app_assets_bucket_arn = module.s3.app_assets_bucket_arn
   sqs_queue_arn         = module.sqs.queue_arn
+  sqs_dlq_arn           = module.sqs.dlq_arn
   ecr_repository_arn    = module.ecr.repository_arn
   ecs_cluster_name      = local.ecs_cluster_name
   ecs_service_name      = local.ecs_service_name
@@ -121,7 +123,13 @@ module "cloudwatch" {
   redis_cluster_id        = module.elasticache.cluster_id
   dlq_name                = module.sqs.dlq_name
   alarm_email             = var.alarm_email
-  tags                    = local.tags
+
+  # V5 (Reliability)
+  sqs_queue_name                = module.sqs.queue_name
+  queue_max_message_age_seconds = var.queue_max_message_age_seconds
+  payment_unavailable_threshold = var.payment_unavailable_threshold
+
+  tags = local.tags
 }
 
 module "ecs" {
@@ -153,6 +161,20 @@ module "ecs" {
   worker_task_role_arn     = module.iam.ecs_worker_task_role_arn
   worker_security_group_id = module.security_groups.worker_sg_id
   worker_desired_count     = var.worker_desired_count
+
+  # V5 (Reliability): timeouts, retry budgets, breaker/bulkhead limits, and
+  # the fake payment gateway sidecar. See docs/adr/ADR-006-reliability.md.
+  sqs_dlq_name                      = module.sqs.dlq_name
+  sqs_visibility_timeout_seconds    = var.sqs_visibility_timeout_seconds
+  payment_gateway_success_rate      = var.payment_gateway_success_rate
+  payment_connect_timeout_seconds   = var.payment_connect_timeout_seconds
+  payment_read_timeout_seconds      = var.payment_read_timeout_seconds
+  payment_retry_attempts            = var.payment_retry_attempts
+  circuit_breaker_failure_threshold = var.circuit_breaker_failure_threshold
+  circuit_breaker_recovery_seconds  = var.circuit_breaker_recovery_seconds
+  payment_bulkhead_max_concurrency  = var.payment_bulkhead_max_concurrency
+  db_statement_timeout_seconds      = var.db_statement_timeout_seconds
+  worker_handler_retry_attempts     = var.worker_handler_retry_attempts
 
   tags = local.tags
 }

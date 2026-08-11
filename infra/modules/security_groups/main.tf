@@ -50,7 +50,7 @@ resource "aws_security_group" "ecs" {
 
 resource "aws_security_group" "rds" {
   name        = "${var.name}-rds-sg"
-  description = "Allow inbound PostgreSQL from ECS tasks only"
+  description = "Allow inbound PostgreSQL from ECS tasks and the worker only"
   vpc_id      = var.vpc_id
 
   ingress {
@@ -59,6 +59,20 @@ resource "aws_security_group" "rds" {
     to_port         = var.db_port
     protocol        = "tcp"
     security_groups = [aws_security_group.ecs.id]
+  }
+
+  # V5 (Reliability): the worker now writes the processed_events table
+  # (app/core/idempotency.py), because Redis alone cannot be the authority on
+  # whether a side effect already ran — a key that can be evicted or lost on
+  # restart stops deduplicating under exactly the conditions that cause
+  # redeliveries. V4's worker deliberately had no DB access at all, so without
+  # this rule the worker would work locally and fail only in AWS.
+  ingress {
+    description     = "Postgres from the worker"
+    from_port       = var.db_port
+    to_port         = var.db_port
+    protocol        = "tcp"
+    security_groups = [aws_security_group.worker.id]
   }
 
   egress {
@@ -105,13 +119,13 @@ resource "aws_security_group" "redis" {
 }
 
 ### V4: the worker (app/worker.py) never accepts inbound traffic at all —
-### it only calls out to SQS and Redis — so it gets no ingress rules
-### whatsoever, unlike every other tier above. A cheap, explicit
+### it only calls out to SQS, Redis, and (as of V5) RDS — so it gets no
+### ingress rules whatsoever, unlike every other tier above. A cheap, explicit
 ### illustration that not every compute tier needs an open inbound port.
 
 resource "aws_security_group" "worker" {
   name        = "${var.name}-worker-sg"
-  description = "Worker task: no inbound traffic accepted, egress only (SQS, Redis)"
+  description = "Worker task: no inbound traffic accepted, egress only (SQS, Redis, RDS)"
   vpc_id      = var.vpc_id
 
   egress {

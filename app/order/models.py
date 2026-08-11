@@ -13,6 +13,18 @@ class OrderStatus(str, enum.Enum):
     PAYMENT_FAILED = "PAYMENT_FAILED"
     CANCELLED = "CANCELLED"
 
+    # V5 (Reliability): the gateway never answered, so we genuinely do not
+    # know whether the card was charged. Distinct from PAYMENT_FAILED, which
+    # means the gateway answered and declined.
+    #
+    # Collapsing the two would force a guess, and both guesses are bad: call
+    # it PAID and we might ship goods nobody paid for; call it PAYMENT_FAILED
+    # and we release stock for an order the customer was charged for. Keeping
+    # the uncertainty in the data model is the honest option — an order in
+    # this state is waiting on reconciliation against the gateway, which is
+    # V12's (Saga) job. See docs/adr/ADR-006-reliability.md.
+    PAYMENT_PENDING = "PAYMENT_PENDING"
+
 
 class Order(Base):
     __tablename__ = "orders"

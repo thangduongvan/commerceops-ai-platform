@@ -71,6 +71,25 @@ variable "dlq_name" {
   type        = string
 }
 
+# V5 — Reliability (see docs/adr/ADR-006-reliability.md)
+
+variable "sqs_queue_name" {
+  description = "Name of the order-events queue, for the oldest-message-age alarm"
+  type        = string
+}
+
+variable "queue_max_message_age_seconds" {
+  description = "Age of the oldest order-events message above which the queue is considered stuck rather than busy. Adding workers cannot fix this, so it pages instead of scaling."
+  type        = number
+  default     = 300
+}
+
+variable "payment_unavailable_threshold" {
+  description = "Orders per minute finishing without a payment answer (PAYMENT_PENDING) before alarming"
+  type        = number
+  default     = 5
+}
+
 variable "tags" {
   type    = map(string)
   default = {}

@@ -136,6 +136,93 @@ variable "worker_memory" {
   default = 512
 }
 
+# V5 — Reliability (see docs/adr/ADR-006-reliability.md)
+
+variable "sqs_dlq_name" {
+  description = "Name of the order-events dead-letter queue. The worker needs it to park poison messages directly (app/worker.py), rather than burning max_receive_count redeliveries on a body that can never parse."
+  type        = string
+}
+
+variable "sqs_visibility_timeout_seconds" {
+  description = "Passed to the app and worker so the worker's in-process retry budget and the lease TTL stay consistent with the queue's actual configuration"
+  type        = number
+  default     = 60
+}
+
+variable "payment_gateway_port" {
+  description = "Port the fake_gateway sidecar listens on. Reached over localhost from the app container, since awsvpc gives containers in a task a shared network namespace."
+  type        = number
+  default     = 9000
+}
+
+variable "payment_gateway_success_rate" {
+  description = "Fraction of charges the stand-in gateway approves under normal conditions. Fault injection is applied at runtime via its /admin/chaos endpoint, not here."
+  type        = number
+  default     = 0.8
+}
+
+variable "payment_connect_timeout_seconds" {
+  type    = number
+  default = 1.0
+}
+
+variable "payment_read_timeout_seconds" {
+  description = "How long to wait for the gateway's answer. Exceeding it produces an UNKNOWN outcome (the charge may have happened), not a failure — see PAYMENT_PENDING in app/order/models.py."
+  type        = number
+  default     = 2.0
+}
+
+variable "payment_retry_attempts" {
+  description = "Total attempts per charge. 4 with base 1.0 and multiplier 2.0 is the 1s / 2s / 4s ladder."
+  type        = number
+  default     = 4
+}
+
+variable "retry_base_delay_seconds" {
+  type    = number
+  default = 1.0
+}
+
+variable "retry_max_delay_seconds" {
+  type    = number
+  default = 8.0
+}
+
+variable "circuit_breaker_failure_threshold" {
+  description = "Consecutive failures before the payment circuit opens and calls fail fast instead of paying the full retry budget"
+  type        = number
+  default     = 5
+}
+
+variable "circuit_breaker_recovery_seconds" {
+  description = "How long the circuit stays open before admitting one trial call"
+  type        = number
+  default     = 30
+}
+
+variable "payment_bulkhead_max_concurrency" {
+  description = "Cap on concurrent gateway calls, so a hanging gateway can't consume FastAPI's whole thread pool and take unrelated endpoints down with it"
+  type        = number
+  default     = 10
+}
+
+variable "db_connect_timeout_seconds" {
+  type    = number
+  default = 5
+}
+
+variable "db_statement_timeout_seconds" {
+  description = "Server-side PostgreSQL statement_timeout. Without it, one hung query holds a pool connection indefinitely and enough of them starve the whole service."
+  type        = number
+  default     = 5
+}
+
+variable "worker_handler_retry_attempts" {
+  description = "In-process attempts per handler in app/worker.py. Deliberately smaller than the payment ladder: the whole budget has to fit inside the visibility timeout, and SQS redelivery already provides the slow retries."
+  type        = number
+  default     = 3
+}
+
 variable "tags" {
   type    = map(string)
   default = {}

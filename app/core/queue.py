@@ -23,16 +23,38 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 from app.core.config import settings
+from app.core.reliability import RetriesExhausted, retry_with_backoff
 
 logger = logging.getLogger(__name__)
+
+
+def sqs_client_config(read_timeout: Optional[float] = None) -> Config:
+    """V5 (Reliability): explicit timeouts, and boto3's own retries off.
+
+    Two independent retry layers (botocore's plus app/core/reliability.py's)
+    multiply into attempts nobody counted and hide the real request rate from
+    the logs, so retries live in exactly one place — ours, where they're
+    logged and jittered. See docs/adr/ADR-006-reliability.md.
+
+    read_timeout is overridable because the worker's long poll legitimately
+    holds a connection open for WaitTimeSeconds; see app/worker.py.
+    """
+    return Config(
+        connect_timeout=settings.sqs_connect_timeout_seconds,
+        read_timeout=read_timeout or settings.sqs_read_timeout_seconds,
+        retries={"max_attempts": 1, "mode": "standard"},
+    )
+
 
 _sqs_client = boto3.client(
     "sqs",
     region_name=settings.aws_region,
     endpoint_url=settings.sqs_endpoint_url,
+    config=sqs_client_config(),
 )
 
 # Populated lazily by _queue_url() the first time each queue name is
@@ -58,12 +80,32 @@ def resolve_queue_url(queue_name: str) -> str:
     return _queue_url_cache[queue_name]
 
 
+def queue_reachable() -> bool:
+    """V5: can we resolve the queue right now? Used by the deep health probe
+    in app/main.py. Never raises, and never retries — a health probe should
+    report the current state, not spend seconds trying to improve it."""
+    try:
+        resolve_queue_url(settings.sqs_queue_name)
+        return True
+    except (BotoCoreError, ClientError):
+        return False
+
+
 def publish_event(event_type: str, payload: dict[str, Any]) -> Optional[str]:
     """Best-effort publish of a business event to the order-events queue.
 
-    Returns the generated event_id on success, or None if the publish
+    Returns the generated event_id on success, or None if every attempt
     failed. Never raises: a queue outage degrades to "this order's async
     side effects are skipped", not to a failed order request.
+
+    V5 (Reliability): no longer single-shot. The event_id and body are built
+    once and reused across attempts, so a retry that succeeds after an
+    ambiguous first failure produces at most a duplicate delivery of the
+    *same* event_id — which app/core/idempotency.py already deduplicates.
+    Retries are deliberately fast (base 0.1s, not the 1s payment ladder):
+    this runs inline in the order request, so the budget has to stay within
+    a latency the customer wouldn't notice. Genuinely durable publishing
+    (atomic with the DB commit) is still V11's transactional outbox.
     """
     event_id = str(uuid.uuid4())
     message = {
@@ -72,10 +114,23 @@ def publish_event(event_type: str, payload: dict[str, Any]) -> Optional[str]:
         "payload": payload,
         "occurred_at": datetime.now(timezone.utc).isoformat(),
     }
-    try:
+    body = json.dumps(message)
+
+    def _send() -> None:
         queue_url = resolve_queue_url(settings.sqs_queue_name)
-        _sqs_client.send_message(QueueUrl=queue_url, MessageBody=json.dumps(message))
-    except (BotoCoreError, ClientError):
+        _sqs_client.send_message(QueueUrl=queue_url, MessageBody=body)
+
+    try:
+        retry_with_backoff(
+            _send,
+            attempts=settings.sqs_publish_retry_attempts,
+            base_delay=settings.publish_retry_base_delay_seconds,
+            multiplier=settings.retry_multiplier,
+            max_delay=settings.retry_max_delay_seconds,
+            retry_on=(BotoCoreError, ClientError),
+            name=f"publish_event:{event_type}",
+        )
+    except (RetriesExhausted, BotoCoreError, ClientError):
         logger.warning(
             "publish_event failed for event_type=%s, side effects will not run for this event",
             event_type,

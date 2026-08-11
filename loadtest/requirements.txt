@@ -5,3 +5,7 @@ locust>=2.29,<3.0
 # V4 (Asynchronous Processing): queue_experiment.py talks to SQS/LocalStack
 # directly (not via the app's HTTP API), so it needs boto3 too.
 boto3>=1.34,<2.0
+
+# V5 (Reliability): chaos_experiment.py drives the app's HTTP API and the
+# stand-in gateway's /admin/chaos endpoint.
+httpx>=0.27,<1.0

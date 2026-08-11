@@ -203,6 +203,106 @@ resource "aws_cloudwatch_metric_alarm" "dlq_messages_present" {
   tags = var.tags
 }
 
+### V5: queue depth alone cannot distinguish "busy" from "stuck". A backlog of
+### 500 messages draining steadily is healthy; a backlog of 3 whose oldest
+### message is 20 minutes old means something is wedged — a handler failing
+### repeatedly, or no consumer running at all. The autoscaling alarms in
+### infra/modules/autoscaling react to depth (add workers); this one reacts to
+### *age*, where adding workers won't help.
+
+resource "aws_cloudwatch_metric_alarm" "queue_oldest_message_age_high" {
+  alarm_name          = "${var.name}-order-events-oldest-message-age-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "ApproximateAgeOfOldestMessage"
+  namespace           = "AWS/SQS"
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = var.queue_max_message_age_seconds
+  alarm_description   = "Oldest order-events message older than ${var.queue_max_message_age_seconds}s — the queue is stuck, not merely busy (see ADR-006)"
+  alarm_actions       = [aws_sns_topic.alarms.arn]
+  ok_actions          = [aws_sns_topic.alarms.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    QueueName = var.sqs_queue_name
+  }
+
+  tags = var.tags
+}
+
+### V5: application-level reliability signals, not infrastructure metrics.
+###
+### Every alarm above this point watches something AWS measures for us — CPU,
+### connections, queue depth. But an open circuit breaker or an exhausted
+### retry budget is invisible at that layer: the ECS task is healthy, CPU is
+### low, the ALB sees 200s (orders come back as PAYMENT_PENDING, not 500s). The
+### only place that knowledge exists is the application's own logs, so we
+### extract metrics from them. The log line shapes these filters match are
+### emitted by app/core/reliability.py and app/payment/gateway_client.py —
+### changing those strings breaks these alarms silently, which is the standing
+### trade-off of log-derived metrics (proper instrumentation is V16's job).
+
+resource "aws_cloudwatch_log_metric_filter" "circuit_breaker_open" {
+  name           = "${var.name}-circuit-breaker-open"
+  log_group_name = aws_cloudwatch_log_group.app.name
+  pattern        = "circuit_breaker state=OPEN"
+
+  metric_transformation {
+    name          = "CircuitBreakerOpen"
+    namespace     = "CommerceOps/Reliability"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "circuit_breaker_open" {
+  alarm_name          = "${var.name}-circuit-breaker-open"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "CircuitBreakerOpen"
+  namespace           = "CommerceOps/Reliability"
+  period              = 60
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "A circuit breaker opened — a dependency is failing consistently enough that the app has stopped calling it"
+  alarm_actions       = [aws_sns_topic.alarms.arn]
+  ok_actions          = [aws_sns_topic.alarms.arn]
+  treat_missing_data  = "notBreaching"
+
+  tags = var.tags
+}
+
+resource "aws_cloudwatch_log_metric_filter" "payment_gateway_unavailable" {
+  name           = "${var.name}-payment-gateway-unavailable"
+  log_group_name = aws_cloudwatch_log_group.app.name
+  pattern        = "payment_gateway_unavailable"
+
+  metric_transformation {
+    name          = "PaymentGatewayUnavailable"
+    namespace     = "CommerceOps/Reliability"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "payment_gateway_unavailable" {
+  alarm_name          = "${var.name}-payment-gateway-unavailable"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "PaymentGatewayUnavailable"
+  namespace           = "CommerceOps/Reliability"
+  period              = 60
+  statistic           = "Sum"
+  threshold           = var.payment_unavailable_threshold
+  alarm_description   = "More than ${var.payment_unavailable_threshold} orders per minute finished without a payment answer (timeout/open circuit/shed) — these are PAYMENT_PENDING orders awaiting reconciliation, and they are invisible to ALB 5xx and ECS CPU alarms"
+  alarm_actions       = [aws_sns_topic.alarms.arn]
+  ok_actions          = [aws_sns_topic.alarms.arn]
+  treat_missing_data  = "notBreaching"
+
+  tags = var.tags
+}
+
 resource "aws_cloudwatch_metric_alarm" "alb_unhealthy_hosts" {
   alarm_name          = "${var.name}-alb-unhealthy-hosts"
   comparison_operator = "GreaterThanThreshold"

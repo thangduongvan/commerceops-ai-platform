@@ -17,10 +17,33 @@ resource "aws_sqs_queue" "dlq" {
   tags = merge(var.tags, { Name = "${var.name}-order-events-dlq" })
 }
 
+# V5 (Reliability): without this, AWS's own DLQ redrive
+# (`aws sqs start-message-move-task`, or the console's "Start DLQ redrive")
+# refuses to move messages back to the source queue. V4 documented redrive as
+# the recovery path but never authorized it — so the documented runbook would
+# have failed the first time anyone actually needed it. `python -m app.dlq
+# redrive` doesn't need this (it's an ordinary send to the main queue), but the
+# AWS-native path is the one an operator reaches for first.
+resource "aws_sqs_queue_redrive_allow_policy" "dlq" {
+  queue_url = aws_sqs_queue.dlq.id
+
+  redrive_allow_policy = jsonencode({
+    redrivePermission = "byQueue"
+    sourceQueueArns   = [aws_sqs_queue.order_events.arn]
+  })
+}
+
 resource "aws_sqs_queue" "order_events" {
   name = "${var.name}-order-events"
 
   visibility_timeout_seconds = var.visibility_timeout_seconds
+
+  # V5: long polling at the queue level, not just in the client's
+  # receive_message call. Any consumer that forgets WaitTimeSeconds (the DLQ
+  # tooling, an ad-hoc `aws sqs receive-message`) now still waits for messages
+  # to arrive instead of returning empty immediately and being retried in a
+  # tight, billable loop.
+  receive_wait_time_seconds = var.receive_wait_time_seconds
 
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.dlq.arn

@@ -53,3 +53,8 @@ output "sqs_queue_name" {
 output "worker_service_name" {
   value = module.ecs.worker_service_name
 }
+
+output "sqs_dlq_name" {
+  description = "Name of the order-events DLQ. Pass as SQS_DLQ_NAME to `python -m app.dlq inspect|redrive` (V5)."
+  value       = module.sqs.dlq_name
+}
