@@ -8,6 +8,7 @@ The [CommerceOps AI Platform learning project](../Solution%20Architect%20Learnin
 * **V3 — Caching**: Redis cache-aside in front of the read-heavy Product endpoints (ElastiCache in AWS), so a flash sale's 90%+ read traffic mostly stops hitting Postgres at all. See [Caching (V3)](#caching-v3) below.
 * **V4 — Asynchronous Processing**: order creation publishes events to an SQS queue instead of calling Notification/Analytics/Email/Search indexing in-process; a separate worker service consumes them off the request path. See [Asynchronous Processing (V4)](#asynchronous-processing-v4) below.
 * **V5 — Reliability**: timeouts on every external call, retry with jittered exponential backoff, a circuit breaker and bulkhead around the payment gateway, and durable per-handler idempotency — so a failing dependency degrades one feature instead of taking the platform down. See [Reliability (V5)](#reliability-v5) below.
+* **V6 — Database High Availability**: RDS Multi-AZ (RPO ≈ 0, automatic failover), automated backups/PITR, an asynchronous read replica for product reads, and local streaming replication so lag/RPO/failover are learnable without an AWS bill. See [Database High Availability (V6)](#database-high-availability-v6) below.
 
 ## V0: Local architecture
 
@@ -36,7 +37,8 @@ app/
 ├── dlq.py                    # V5: DLQ inspect/redrive/purge CLI (python -m app.dlq)
 ├── core/
 │   ├── config.py           # environment-driven settings
-│   ├── database.py         # SQLAlchemy engine/session, Base, get_db
+│   ├── database.py         # SQLAlchemy engine/session, Base, get_db;
+│   │                       # V6: get_read_db, pool_recycle, replica lag probe
 │   ├── cache.py            # V3: Redis cache-aside helpers
 │   ├── queue.py             # V4: SQS producer (publish_event)
 │   ├── reliability.py        # V5: retry/backoff, circuit breaker, bulkhead
@@ -62,25 +64,29 @@ docs/
 ├── api.md                          # endpoint reference
 ├── database_schema.md              # ER diagram
 ├── deployment.md                   # V1: AWS deployment; V2: load test; V3: caching
-│                                   # experiment; V4: backpressure; V5: fault injection
+│                                   # experiment; V4: backpressure; V5: fault injection;
+│                                   # V6: Multi-AZ / failover / PITR drills
 └── adr/
     ├── ADR-001-modular-monolith.md
     ├── ADR-002-aws-foundation.md
     ├── ADR-003-horizontal-scaling.md
     ├── ADR-004-caching.md
     ├── ADR-005-async-processing.md
-    └── ADR-006-reliability.md
+    ├── ADR-006-reliability.md
+    └── ADR-007-database-ha.md
 
-infra/                             # V1-V5: Terraform (see "Deploying to AWS" below)
+infra/                             # V1-V6: Terraform (see "Deploying to AWS" below)
 ├── bootstrap/                      # one-time: remote state S3 bucket + DynamoDB lock table
 ├── modules/                        # vpc, security_groups, ecr, s3, iam, rds, elasticache, sqs, alb, ecs, autoscaling, cloudwatch
 ├── environments/dev/               # wires the modules together for the dev environment
-└── localstack/                     # V4: LocalStack init script (creates the local order-events queue + DLQ)
+├── localstack/                     # V4: LocalStack init script (creates the local order-events queue + DLQ)
+└── postgres/                       # V6: primary init + standby entrypoint for Compose streaming replication
 
-loadtest/                          # V2: Locust; V4: backpressure; V5: chaos
+loadtest/                          # V2: Locust; V4: backpressure; V5: chaos; V6: HA drills
 ├── locustfile.py
 ├── queue_experiment.py             # V4: produce/consume/depth against SQS or LocalStack
 ├── chaos_experiment.py             # V5: payment timeout / 50% failure / crash / duplicate
+├── ha_experiment.py                # V6: lag / promote-local / failover-aws / restore-pitr
 └── requirements.txt
 
 .github/workflows/deploy.yml        # V1: build/push to ECR + redeploy ECS on push to main
@@ -97,7 +103,8 @@ docker compose up --build
 ```
 
 * App: http://localhost:8000 (Swagger UI at `/docs`, health check at `/health`, dependency probe at `/health/ready`)
-* Postgres: `localhost:5432` (user/password/db: `commerceops`)
+* Postgres primary: `localhost:5432` (user/password/db: `commerceops`)
+* Postgres replica (V6 hot standby): `localhost:5433`
 * Payment gateway (V5 stand-in): http://localhost:9000 — fault injection via `POST /admin/chaos`
 
 ## Running locally without Docker
@@ -283,6 +290,45 @@ flowchart LR
 * **Chaos experiments**: [loadtest/chaos_experiment.py](loadtest/chaos_experiment.py) injects the spec's four faults — payment timeout, 50% API failure, consumer crash, duplicate event — plus the bulkhead isolation check (`/orders` hanging while `/products` stays fast). See [docs/deployment.md](docs/deployment.md#9-v5-reliability).
 * **Why hand-written primitives over `tenacity`/`pybreaker`, why the composition order is what it is, why `PAYMENT_PENDING` holds stock, and per-dependency blast radius**: [ADR-006](docs/adr/ADR-006-reliability.md).
 
+## Database High Availability (V6)
+
+New requirement: `RTO ≤ 5 minutes`, `RPO ≈ 0`, and a database outage must not lose confirmed orders. V1 deliberately shipped single-AZ RDS with `skip_final_snapshot = true` for cheap destroy cycles ([ADR-002](docs/adr/ADR-002-aws-foundation.md)); V6 replaces that with the mechanisms that actually meet the objectives — and makes the distinctions between them measurable.
+
+```mermaid
+flowchart TB
+    subgraph azA [AZ a]
+        ECS1["ECS tasks"]
+        Primary[("RDS primary")]
+    end
+    subgraph azB [AZ b]
+        ECS2["ECS tasks"]
+        Standby[("Multi-AZ standby<br/>synchronous, not readable")]
+        Replica[("read replica<br/>asynchronous, own endpoint")]
+    end
+    ECS1 -->|"writes + order reads"| Primary
+    ECS2 --> Primary
+    ECS1 -.->|"product reads only"| Replica
+    ECS2 -.-> Replica
+    Primary ==>|"synchronous, RPO 0"| Standby
+    Primary -.->|"asynchronous, lag > 0"| Replica
+    Primary --> Backup[["automated backups + PITR"]]
+```
+
+The load-bearing lesson is `HA ≠ Backup ≠ Read Replica ≠ DR`:
+
+| Failure | Mechanism | Notes |
+|---|---|---|
+| AZ / instance dies | **Multi-AZ** (synchronous standby) | Automatic failover, same DNS endpoint, RPO ≈ 0, RTO ~60–120s |
+| Accidental `DELETE` / corruption | **Automated backups + PITR** | Multi-AZ makes this *worse* (the delete replicates). Restore → new instance, tens of minutes — cannot meet RTO ≤ 5 min |
+| Read scaling | **Read replica** (asynchronous) | Own endpoint, lag > 0, no auto-failover. Product GETs only |
+| Region disappears | *(nothing in V6)* | Cross-region is V18 |
+
+* **Terraform**: [infra/modules/rds](infra/modules/rds) — `multi_az`, `deletion_protection`, final snapshot, backup/maintenance windows, gated `aws_db_instance.replica`. [infra/modules/cloudwatch](infra/modules/cloudwatch) — RDS event subscription (failover is invisible to CPU/5xx alarms), `ReplicaLag` alarm, `read_replica_unavailable` log-metric filter.
+* **Local streaming replication**: Compose `db` + `db-replica` ([infra/postgres/](infra/postgres/)) so lag, promotion, and RPO are learnable for free — same "swappable backend" pattern as Postgres/RDS and LocalStack/SQS.
+* **App**: [app/core/database.py](app/core/database.py) — `pool_recycle`, `get_read_db()` (aliases the write engine when no replica is configured), reads-only transient retry. [app/product/router.py](app/product/router.py) — GETs on the replica with primary fallback; orders/customers stay on the primary (read-your-own-writes).
+* **Drills**: [loadtest/ha_experiment.py](loadtest/ha_experiment.py) — `lag`, `promote-local` (RPO), `failover-aws` (RTO via `reboot-db-instance --force-failover`), `restore-pitr` (why backups ≠ HA). See [docs/deployment.md](docs/deployment.md#10-v6-database-high-availability).
+* **Why Multi-AZ instance (not cluster/Aurora), why only product reads use the replica, why teardown is now two steps**: [ADR-007](docs/adr/ADR-007-database-ha.md).
+
 ## Roadmap
 
 * [x] V0 — Local Modular Monolith
@@ -291,7 +337,7 @@ flowchart LR
 * [x] V3 — Redis Caching
 * [x] V4 — Asynchronous Processing (SQS)
 * [x] V5 — Reliability (timeouts, retry/backoff, circuit breaker, bulkhead, idempotency)
-* [ ] V6 — Database High Availability (Multi-AZ, backups/PITR, read replica)
+* [x] V6 — Database High Availability (Multi-AZ, backups/PITR, read replica)
 * [ ] V7+ — Microservices, Event-Driven Architecture, Kafka, CQRS, Outbox, Saga, AI Operations Agent, Observability, Security, Disaster Recovery, Cost Optimization
 
 Per the [learning project plan](../Solution%20Architect%20Learning%20Project.md).

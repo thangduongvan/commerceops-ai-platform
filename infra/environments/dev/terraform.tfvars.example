@@ -68,6 +68,29 @@ payment_bulkhead_max_concurrency  = 10
 db_statement_timeout_seconds  = 5
 worker_handler_retry_attempts = 3
 
+# V6 — Database HA: Multi-AZ (synchronous standby, RPO ≈ 0), automated
+# backups/PITR, and an optional asynchronous read replica for product reads.
+# See ADR-007.
+#
+# COST NOTE: Multi-AZ roughly doubles the RDS instance bill; the replica adds
+# a third. Per the learning project plan ("deploy temporarily, benchmark,
+# destroy"), leave these on for the HA drills, then flip them off before a
+# long idle period:
+#   rds_multi_az              = false
+#   rds_read_replica_enabled  = false
+#   rds_deletion_protection   = false
+#   rds_skip_final_snapshot   = true
+# Teardown with deletion_protection=true is two steps — see docs/deployment.md §10.
+rds_multi_az             = true
+rds_deletion_protection  = true
+rds_skip_final_snapshot  = false
+rds_read_replica_enabled = true
+rds_replica_instance_class = "db.t3.micro"
+
+rds_replica_lag_threshold_seconds  = 30
+read_replica_unavailable_threshold = 5
+db_pool_recycle_seconds            = 300
+
 # Must match the repo hosting this code, or the GitHub Actions OIDC trust policy
 # will reject the workflow's token.
 github_repo   = "thangduongvan/commerceops-ai-platform"

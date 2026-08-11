@@ -5,15 +5,63 @@ services:
       POSTGRES_USER: commerceops
       POSTGRES_PASSWORD: commerceops
       POSTGRES_DB: commerceops
+    # V6 (Database HA): enable WAL shipping so db-replica can stream.
+    # Asynchronous by default (matches an RDS read replica). For the RPO
+    # experiment that needs synchronous commit, append:
+    #   -c synchronous_standby_names='*'
+    # to this command — and observe that the primary then blocks when the
+    # standby is gone. That is exactly why RDS Multi-AZ needs a healthy
+    # standby. See docs/adr/ADR-007-database-ha.md.
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+      - -c
+      - hot_standby=on
     ports:
       - "5432:5432"
     volumes:
       - db_data:/var/lib/postgresql/data
+      - ./infra/postgres/init-replication.sh:/docker-entrypoint-initdb.d/01-init-replication.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U commerceops"]
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # V6: hot standby via streaming replication. Own endpoint on :5433 so the
+  # app can exercise a real read/write split (and the lag / promote-local
+  # drills) without paying for AWS. Bootstrap is pg_basebackup -Xs -R -S —
+  # see infra/postgres/standby-entrypoint.sh.
+  db-replica:
+    image: postgres:16
+    user: postgres
+    environment:
+      PRIMARY_HOST: db
+      REPLICATOR_USER: replicator
+      REPLICATOR_PASSWORD: commerceops
+      REPLICATION_SLOT: commerceops_standby
+      PGDATA: /var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    volumes:
+      - db_replica_data:/var/lib/postgresql/data
+      - ./infra/postgres/standby-entrypoint.sh:/standby-entrypoint.sh:ro
+    entrypoint: ["/bin/bash", "/standby-entrypoint.sh"]
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # pg_is_in_recovery() = true means we are a standby serving reads.
+      test: ["CMD-SHELL", "pg_isready -U commerceops && psql -U commerceops -d commerceops -tAc 'SELECT pg_is_in_recovery()' | grep -q t"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
 
   redis:
     image: redis:7-alpine
@@ -67,6 +115,13 @@ services:
     build: .
     environment:
       DATABASE_URL: postgresql+psycopg://commerceops:commerceops@db:5432/commerceops
+      # V6: product reads go to the hot standby. Same credentials (physical
+      # replication); only the host differs. READ_REPLICA_ENABLED=false
+      # (or omitting DATABASE_READ_URL) makes the app use the primary for
+      # everything — useful when running without db-replica.
+      DATABASE_READ_URL: postgresql+psycopg://commerceops:commerceops@db-replica:5432/commerceops
+      READ_REPLICA_ENABLED: "true"
+      DB_POOL_RECYCLE_SECONDS: "300"
       APP_NAME: CommerceOps AI Platform
       ENVIRONMENT: local
       REDIS_URL: redis://redis:6379/0
@@ -85,6 +140,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      db-replica:
+        condition: service_healthy
       redis:
         condition: service_healthy
       localstack:
@@ -102,11 +159,16 @@ services:
   # table, because a Redis key that can be evicted or lost on restart cannot
   # be the only thing standing between a retry and a duplicate business
   # effect. Redis stays in front of it as a cache and as the in-flight lease.
+  #
+  # V6: READ_REPLICA_ENABLED=false — the worker writes processed_events and
+  # must never use the asynchronous replica.
   worker:
     build: .
     command: python -m app.worker
     environment:
       DATABASE_URL: postgresql+psycopg://commerceops:commerceops@db:5432/commerceops
+      READ_REPLICA_ENABLED: "false"
+      DB_POOL_RECYCLE_SECONDS: "300"
       APP_NAME: CommerceOps AI Platform
       ENVIRONMENT: local
       REDIS_URL: redis://redis:6379/0
@@ -124,3 +186,4 @@ services:
 
 volumes:
   db_data:
+  db_replica_data:

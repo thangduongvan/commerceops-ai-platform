@@ -223,6 +223,26 @@ variable "worker_handler_retry_attempts" {
   default     = 3
 }
 
+# V6 — Database HA (see docs/adr/ADR-007-database-ha.md)
+
+variable "db_read_host" {
+  description = "Read-replica hostname for product reads. Empty/null means the app uses the primary for everything."
+  type        = string
+  default     = null
+}
+
+variable "read_replica_enabled" {
+  description = "When true, product GET endpoints use DB_READ_HOST. The worker always stays on the primary (it writes processed_events)."
+  type        = bool
+  default     = false
+}
+
+variable "db_pool_recycle_seconds" {
+  description = "SQLAlchemy pool_recycle. Bounds how long a pooled connection to a pre-failover primary can linger after Multi-AZ failover."
+  type        = number
+  default     = 300
+}
+
 variable "tags" {
   type    = map(string)
   default = {}

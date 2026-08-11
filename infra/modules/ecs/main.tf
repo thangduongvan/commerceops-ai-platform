@@ -66,6 +66,14 @@ resource "aws_ecs_task_definition" "app" {
         { name = "PAYMENT_BULKHEAD_MAX_CONCURRENCY", value = tostring(var.payment_bulkhead_max_concurrency) },
         { name = "DB_CONNECT_TIMEOUT_SECONDS", value = tostring(var.db_connect_timeout_seconds) },
         { name = "DB_STATEMENT_TIMEOUT_SECONDS", value = tostring(var.db_statement_timeout_seconds) },
+        # V6 (Database HA): product reads may go to the asynchronous replica.
+        # Credentials are shared with the primary (physical replication), so
+        # only the host differs. Empty DB_READ_HOST + READ_REPLICA_ENABLED=false
+        # makes the app use the primary for everything — same shape as the
+        # local Compose default when the standby is not running.
+        { name = "DB_READ_HOST", value = coalesce(var.db_read_host, "") },
+        { name = "READ_REPLICA_ENABLED", value = tostring(var.read_replica_enabled && var.db_read_host != null && var.db_read_host != "") },
+        { name = "DB_POOL_RECYCLE_SECONDS", value = tostring(var.db_pool_recycle_seconds) },
       ]
 
       # Only the credentials come from Secrets Manager — host/port/dbname are not
@@ -220,6 +228,11 @@ resource "aws_ecs_task_definition" "worker" {
         { name = "DB_STATEMENT_TIMEOUT_SECONDS", value = tostring(var.db_statement_timeout_seconds) },
         { name = "WORKER_HANDLER_RETRY_ATTEMPTS", value = tostring(var.worker_handler_retry_attempts) },
         { name = "IDEMPOTENCY_LEASE_TTL_SECONDS", value = tostring(var.sqs_visibility_timeout_seconds) },
+        # V6: the worker writes processed_events and must never use the
+        # asynchronous replica. Explicit false so a shared task-def template
+        # can't accidentally route it there.
+        { name = "READ_REPLICA_ENABLED", value = "false" },
+        { name = "DB_POOL_RECYCLE_SECONDS", value = tostring(var.db_pool_recycle_seconds) },
       ]
 
       secrets = [

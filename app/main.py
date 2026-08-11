@@ -11,7 +11,7 @@ from app.customer.router import router as customer_router
 from app.core import models as core_models  # noqa: F401
 from app.core.cache import cache_ping
 from app.core.config import settings
-from app.core.database import Base, engine, get_db
+from app.core.database import Base, engine, get_db, replica_lag_seconds
 from app.core.queue import queue_reachable
 from app.payment import gateway_client
 from app.order import models as order_models  # noqa: F401
@@ -84,6 +84,29 @@ def readiness_check(db: Session = Depends(get_db)):
     checks["redis"] = {"ok": cache_ping(), "required": False}
     checks["queue"] = {"ok": queue_reachable(), "required": False}
     checks["payment_gateway"] = gateway_client.probe()
+
+    # V6 (Database HA): replica lag is informational. A lagging or missing
+    # replica never marks the process unhealthy — product reads fall open to
+    # the primary (app/product/service.py), and order/customer never use it.
+    # required=False so nothing automated acts on this field.
+    if settings.read_replica_enabled and settings.database_read_url:
+        lag = replica_lag_seconds()
+        checks["database_replica"] = {
+            "ok": lag is not None,
+            "required": False,
+            "lag_seconds": lag,
+            "max_lag_seconds": settings.db_max_replica_lag_seconds,
+            "lagging": (
+                lag is not None and lag > settings.db_max_replica_lag_seconds
+            ),
+        }
+    else:
+        checks["database_replica"] = {
+            "ok": True,
+            "required": False,
+            "enabled": False,
+            "lag_seconds": None,
+        }
 
     degraded = (
         not checks["database"]["ok"]

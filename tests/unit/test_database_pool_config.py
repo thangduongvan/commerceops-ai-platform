@@ -13,6 +13,8 @@ def test_settings_have_sane_pool_defaults():
 
     assert settings.db_pool_size == 5
     assert settings.db_max_overflow == 3
+    # V6: pool_recycle bounds how long a pre-failover connection can linger.
+    assert settings.db_pool_recycle_seconds == 300
 
 
 def test_module_engine_uses_configured_pool_size():

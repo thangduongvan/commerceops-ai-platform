@@ -59,7 +59,18 @@ module "rds" {
   db_name            = var.db_name
   db_username        = var.db_username
   instance_class     = var.rds_instance_class
-  tags               = local.tags
+
+  # V6 (Database HA): Multi-AZ + backups/PITR + optional read replica.
+  # Defaults are the safe ones; flip multi_az / read_replica_enabled /
+  # deletion_protection off for cheap destroy cycles — see ADR-007 and
+  # docs/deployment.md §10.
+  multi_az               = var.rds_multi_az
+  deletion_protection    = var.rds_deletion_protection
+  skip_final_snapshot    = var.rds_skip_final_snapshot
+  read_replica_enabled   = var.rds_read_replica_enabled
+  replica_instance_class = var.rds_replica_instance_class
+
+  tags = local.tags
 }
 
 module "elasticache" {
@@ -129,6 +140,11 @@ module "cloudwatch" {
   queue_max_message_age_seconds = var.queue_max_message_age_seconds
   payment_unavailable_threshold = var.payment_unavailable_threshold
 
+  # V6 (Database HA)
+  rds_replica_identifier             = module.rds.replica_identifier
+  rds_replica_lag_threshold_seconds  = var.rds_replica_lag_threshold_seconds
+  read_replica_unavailable_threshold = var.read_replica_unavailable_threshold
+
   tags = local.tags
 }
 
@@ -175,6 +191,13 @@ module "ecs" {
   payment_bulkhead_max_concurrency  = var.payment_bulkhead_max_concurrency
   db_statement_timeout_seconds      = var.db_statement_timeout_seconds
   worker_handler_retry_attempts     = var.worker_handler_retry_attempts
+
+  # V6 (Database HA): product reads may use the replica; the worker stays on
+  # the primary. coalesce so a disabled replica still produces a valid
+  # (empty) DB_READ_HOST string for the task definition.
+  db_read_host            = module.rds.replica_address
+  read_replica_enabled    = var.rds_read_replica_enabled
+  db_pool_recycle_seconds = var.db_pool_recycle_seconds
 
   tags = local.tags
 }

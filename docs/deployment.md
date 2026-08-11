@@ -397,7 +397,118 @@ The reliability alarms to watch in the CloudWatch console while doing this ([inf
 
 The first two are log-metric-filter alarms, because an open circuit is invisible to infrastructure metrics: the task is healthy, CPU is low, and the ALB sees 200s.
 
-## 10. Wire up GitHub Actions CI/CD
+## 10. V6: Database High Availability
+
+New requirement: `RTO ≤ 5 minutes`, `RPO ≈ 0`, and a database outage must not lose confirmed orders. V6 turns on Multi-AZ, backups/PITR, deletion protection, and an optional read replica — and makes the distinctions between them measurable. See [ADR-007](adr/ADR-007-database-ha.md).
+
+### 10.1 Enable Multi-AZ + replica (and the cost note)
+
+In `infra/environments/dev/terraform.tfvars` (see `terraform.tfvars.example`):
+
+```hcl
+rds_multi_az             = true   # ~2x instance cost; synchronous standby
+rds_read_replica_enabled = true   # +1x; asynchronous, product reads only
+rds_deletion_protection  = true   # teardown becomes two steps (below)
+rds_skip_final_snapshot  = false
+```
+
+```powershell
+cd infra/environments/dev
+terraform apply
+```
+
+Multi-AZ conversion and replica creation both take several minutes. Afterwards:
+
+```powershell
+terraform output rds_endpoint
+terraform output rds_replica_endpoint
+terraform output rds_identifier
+```
+
+The app task receives `DB_READ_HOST` + `READ_REPLICA_ENABLED=true`; the worker keeps `READ_REPLICA_ENABLED=false` (it writes `processed_events`).
+
+For cheap idle periods, flip the four flags off and re-apply before a long break — per the learning project's "deploy temporarily, benchmark, destroy" guidance. Leaving Multi-AZ + replica running overnight on `db.t3.micro` is the single largest avoidable cost in this stack after the NAT Gateway.
+
+### 10.2 Local streaming replication (free drills)
+
+```powershell
+docker compose up -d --build
+docker compose exec db psql -U commerceops -d commerceops -c "SELECT * FROM pg_stat_replication;"
+docker compose exec db-replica psql -U commerceops -d commerceops -c "SELECT pg_is_in_recovery();"
+```
+
+Expect a streaming WAL sender on the primary and `t` (in recovery) on the replica. The app's `DATABASE_READ_URL` points at `db-replica`; product GETs use it, orders do not.
+
+### 10.3 Lag drill (read-your-own-writes)
+
+```powershell
+cd loadtest
+pip install -r requirements.txt
+$env:APP_URL = "http://localhost:8000"
+python ha_experiment.py lag
+```
+
+Writes a product on the primary, polls the replica until it appears, and prints `/health/ready`'s `database_replica.lag_seconds`. The lesson: a customer reading their own order right after placing it **cannot** use this replica — that is why only product GETs are routed there.
+
+### 10.4 Local promote drill (RPO experiment)
+
+```powershell
+python ha_experiment.py promote-local --duration 20
+```
+
+Places orders continuously, stops the primary halfway through, and promotes the Compose standby with `pg_ctl promote`. Then compares every HTTP-2xx-confirmed order id against what survived on the promoted standby.
+
+* **Async (default)**: some confirmed orders may be missing → RPO > 0.
+* **Sync**: append `-c synchronous_standby_names='*'` to the `db` service's `command` in `docker-compose.yml`, recreate, and re-run. Lost orders should go to 0 — and the primary will block commits if the standby is stopped. That is exactly why RDS Multi-AZ needs a healthy standby.
+
+This drill leaves Compose broken (primary stopped, replica promoted). Recreate with:
+
+```powershell
+docker compose down -v
+docker compose up -d --build
+```
+
+### 10.5 AWS Multi-AZ failover drill (RTO experiment)
+
+Requires Multi-AZ enabled (§10.1) and an ALB URL:
+
+```powershell
+$env:APP_URL = "http://$(terraform -chdir=../infra/environments/dev output -raw alb_dns_name)"
+$env:RDS_INSTANCE_ID = terraform -chdir=../infra/environments/dev output -raw rds_identifier
+python ha_experiment.py failover-aws
+```
+
+Runs `aws rds reboot-db-instance --force-failover` (Multi-AZ **instance** failover — `failover-db-cluster` is Aurora-only) while polling `/health` and `POST /orders`. Reports measured RTO against the 300s budget and confirms every HTTP-2xx order is still readable afterwards (RPO ≈ 0).
+
+Watch the SNS/email alarm from the RDS event subscription (`failover` category) — a Multi-AZ failover is invisible to CPU / ALB-5xx / unhealthy-host alarms because the endpoint never changed and the tasks stay healthy.
+
+### 10.6 PITR restore drill (why backups ≠ HA)
+
+```powershell
+python ha_experiment.py restore-pitr
+# review the planned command, then:
+python ha_experiment.py restore-pitr --confirm
+```
+
+Reads `LatestRestorableTime`, starts `restore-db-instance-to-point-in-time`, and times how long the **new** instance takes to become available. The payoff: tens of minutes and a new endpoint — concrete proof that backups defend against `DELETE`/corruption, not against AZ failure, and cannot meet RTO ≤ 5 minutes.
+
+Delete the target instance afterwards; it is a full billed RDS instance.
+
+### 10.7 Two-step teardown (deletion protection)
+
+With `rds_deletion_protection = true` (the default), a plain `terraform destroy` fails on the RDS instance. That is the point.
+
+```powershell
+cd infra/environments/dev
+# 1. Disable protection (and optionally skip the final snapshot for a throwaway env)
+terraform apply -var="rds_deletion_protection=false" -var="rds_skip_final_snapshot=true"
+# 2. Destroy
+terraform destroy
+```
+
+Or set both in `terraform.tfvars` before destroy. Leaving the bootstrap state bucket in place is still recommended (step 11 below).
+
+## 11. Wire up GitHub Actions CI/CD
 
 In the GitHub repo: **Settings → Secrets and variables → Actions → Variables**, add:
 
@@ -411,16 +522,18 @@ In the GitHub repo: **Settings → Secrets and variables → Actions → Variabl
 
 No AWS access keys are stored in GitHub — [.github/workflows/deploy.yml](../.github/workflows/deploy.yml) assumes `AWS_ROLE_ARN` via GitHub's OIDC token. From now on, pushes to `main` touching `app/**`/`Dockerfile` automatically build, push, and redeploy.
 
-## 11. Cost control: tear it down when you're done
+## 12. Cost control: tear it down when you're done
 
-Per the learning project's "deploy → test → destroy" principle (avoid paying for idle ALB/NAT/RDS/ElastiCache between sessions):
+Per the learning project's "deploy → test → destroy" principle (avoid paying for idle ALB/NAT/RDS/ElastiCache/Multi-AZ/replica between sessions).
+
+If V6 deletion protection is on, do the two-step teardown in §10.7 first. Otherwise:
 
 ```powershell
 cd infra/environments/dev
 terraform destroy
 ```
 
-Leave the `infra/bootstrap` state bucket/lock table in place (they cost effectively nothing) so you don't have to redo step 1 next time. Re-running steps 3–9 later recreates everything from the same Terraform code.
+Leave the `infra/bootstrap` state bucket/lock table in place (they cost effectively nothing) so you don't have to redo step 1 next time. Re-running steps 3–10 later recreates everything from the same Terraform code.
 
 ## Troubleshooting
 
@@ -433,3 +546,7 @@ Leave the `infra/bootstrap` state bucket/lock table in place (they cost effectiv
 * **Orders return `PAYMENT_PENDING` with `reason: bulkhead_full` under load (V5)**: expected behaviour, not a bug — the payment gateway is slow enough that 10 calls are already in flight, so further orders are shed to protect the rest of the app. If it happens without the gateway being slow, `PAYMENT_BULKHEAD_MAX_CONCURRENCY` is set too low for the traffic.
 * **The worker stops making progress and logs database errors (V5)**: V5 gave the worker a Postgres dependency (`processed_events`), which V4 didn't have. Locally, make sure `db` is running and `DATABASE_URL` is set on the worker service. In AWS, confirm the RDS security group allows ingress from the *worker* security group, not just the app's ([infra/modules/security_groups](../infra/modules/security_groups)).
 * **A message is redelivered while a worker is still processing it (V5)**: the visibility timeout is shorter than the worker's retry budget. `SQS_VISIBILITY_TIMEOUT_SECONDS` (60s), the queue's actual `VisibilityTimeout`, and `infra/localstack/create-queues.sh` all have to agree — check with `awslocal sqs get-queue-attributes --attribute-names VisibilityTimeout`.
+* **`db-replica` never becomes healthy (V6)**: the primary's init script only runs on a *fresh* data volume. If you added replication to an existing `db_data` volume, recreate with `docker compose down -v && docker compose up -d`. Also check `docker compose logs db-replica` for `pg_basebackup` auth failures — the `replicator` role and `host replication ...` pg_hba line come from `infra/postgres/init-replication.sh`.
+* **Product GETs look stale right after a PUT (V6)**: expected under replica lag (and under the existing Redis TTL). `/health/ready` → `checks.database_replica.lag_seconds` shows the current lag. Orders and customers are not affected — they stay on the primary. See [ADR-007](adr/ADR-007-database-ha.md).
+* **`terraform destroy` fails on the RDS instance (V6)**: `deletion_protection` is on. Follow §10.7 (disable protection, then destroy).
+* **Failover drill reports RPO > 0 on Multi-AZ (V6)**: unexpected — Multi-AZ commit is synchronous. Confirm `MultiAZ = true` via `aws rds describe-db-instances`, and that you used `--force-failover` (a plain reboot on single-AZ is just a restart, not a failover).

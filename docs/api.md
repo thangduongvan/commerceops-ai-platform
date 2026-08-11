@@ -9,11 +9,11 @@ Base URL (local): `http://localhost:8000`
 | Method | Path             | Description                                                    |
 | ------ | ---------------- | -------------------------------------------------------------- |
 | GET    | `/health`        | Liveness. Shallow by design — touches no dependency            |
-| GET    | `/health/ready`  | V5: deep dependency probe. Always HTTP 200; see `status` in the body |
+| GET    | `/health/ready`  | V5/V6: deep dependency probe. Always HTTP 200; see `status` in the body |
 
 **Why two (V5)**: `/health` is what the ALB target group polls, so it deliberately checks nothing but "is this process serving HTTP?". A deep check here would mark *every* task unhealthy the moment a shared dependency failed — emptying the target group, returning 503 to everything, and making ECS replace tasks that were working fine. The health check would cause a worse outage than the fault.
 
-`/health/ready` reports database, Redis, queue, and payment gateway state (including circuit-breaker state and bulkhead usage) for humans and dashboards. It returns **HTTP 200 even when degraded**, with `"status": "ok" | "degraded"` in the body, so nothing automated acts on it:
+`/health/ready` reports database, Redis, queue, payment gateway state (including circuit-breaker state and bulkhead usage), and (V6) read-replica lag for humans and dashboards. It returns **HTTP 200 even when degraded**, with `"status": "ok" | "degraded"` in the body, so nothing automated acts on it:
 
 ```json
 {
@@ -23,12 +23,21 @@ Base URL (local): `http://localhost:8000`
     "database": { "ok": true },
     "redis": { "ok": true, "required": false },
     "queue": { "ok": true, "required": false },
-    "payment_gateway": { "reachable": true, "circuit_state": "OPEN", "bulkhead_in_use": 3 }
+    "payment_gateway": { "reachable": true, "circuit_state": "OPEN", "bulkhead_in_use": 3 },
+    "database_replica": {
+      "ok": true,
+      "required": false,
+      "lag_seconds": 0.12,
+      "max_lag_seconds": 5.0,
+      "lagging": false
+    }
   }
 }
 ```
 
-`required: false` on Redis and the queue records that neither is needed to serve traffic correctly — cache reads fall through to Postgres (V3), and a failed publish costs an order its async side effects, not the order (V4/V5). See [ADR-006](adr/ADR-006-reliability.md).
+`required: false` on Redis, the queue, and the replica records that none of them is needed to serve traffic correctly — cache reads fall through to Postgres (V3), a failed publish costs an order its async side effects, not the order (V4/V5), and product reads fall open to the primary when the replica is down (V6). See [ADR-006](adr/ADR-006-reliability.md) and [ADR-007](adr/ADR-007-database-ha.md).
+
+When no replica is configured, `database_replica` reports `"enabled": false` with `lag_seconds: null` and still `ok: true` — a missing replica must not mark the process degraded.
 
 ## Customers
 
@@ -47,6 +56,8 @@ Base URL (local): `http://localhost:8000`
 | PUT    | `/products/{id}`    | any subset of `{name, description, price, stock_quantity}` | partial update, invalidates the detail cache |
 
 **Caching (V3)**: both GET endpoints are served cache-aside from Redis (`cache_ttl_seconds`, default 15s). `GET /products/{id}` is invalidated immediately on `PUT`; `GET /products` listings may lag a write by up to `cache_ttl_seconds` (bounded staleness, not actively invalidated — see [ADR-004](adr/ADR-004-caching.md)). If Redis is unavailable, both endpoints keep working by falling back to PostgreSQL.
+
+**Read replica (V6)**: both GET endpoints also use the asynchronous read replica when `READ_REPLICA_ENABLED=true` (Compose `db-replica`, or the RDS replica in AWS). They may therefore be stale by up to the current replica lag in addition to the Redis TTL. On replica failure they fall open to the primary and log `read_replica_unavailable`. `POST` / `PUT` stay on the primary. Order and customer endpoints never use the replica — a customer reading their own order immediately after placing it cannot tolerate lag. See [ADR-007](adr/ADR-007-database-ha.md).
 
 ## Orders
 

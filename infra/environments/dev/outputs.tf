@@ -19,6 +19,21 @@ output "rds_endpoint" {
   value = module.rds.endpoint
 }
 
+output "rds_identifier" {
+  description = "Primary DB instance identifier — used by loadtest/ha_experiment.py failover-aws / restore-pitr"
+  value       = module.rds.identifier
+}
+
+output "rds_replica_endpoint" {
+  description = "Read-replica endpoint (host:port), or null when the replica is disabled"
+  value       = module.rds.replica_endpoint
+}
+
+output "rds_replica_identifier" {
+  description = "Read-replica instance identifier, or null when disabled"
+  value       = module.rds.replica_identifier
+}
+
 output "rds_master_user_secret_arn" {
   value = module.rds.master_user_secret_arn
 }

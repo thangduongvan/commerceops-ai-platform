@@ -90,6 +90,26 @@ variable "payment_unavailable_threshold" {
   default     = 5
 }
 
+# V6 — Database HA (see docs/adr/ADR-007-database-ha.md)
+
+variable "rds_replica_identifier" {
+  description = "Read-replica instance identifier for ReplicaLag alarms and the event subscription. Null/empty when the replica is disabled."
+  type        = string
+  default     = null
+}
+
+variable "rds_replica_lag_threshold_seconds" {
+  description = "ReplicaLag (seconds) above which product reads may be serving meaningfully stale data"
+  type        = number
+  default     = 30
+}
+
+variable "read_replica_unavailable_threshold" {
+  description = "App log lines of read_replica_unavailable per minute before alarming — the replica path failed open to the primary"
+  type        = number
+  default     = 5
+}
+
 variable "tags" {
   type    = map(string)
   default = {}

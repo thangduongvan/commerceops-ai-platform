@@ -4,7 +4,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.core.database import Base, get_db
+from app.core.database import Base, get_db, get_read_db
 from app.main import app
 
 # Import models so all tables are registered on Base.metadata.
@@ -32,7 +32,20 @@ def _override_get_db():
         db.close()
 
 
+# V6: product GET endpoints depend on get_read_db. Without this override they
+# would hit the module-level Postgres engine (or fail outright in CI). Default
+# both dependencies to the same in-memory DB; test_product_read_routing.py
+# swaps get_read_db for a deliberately stale second engine.
+def _override_get_read_db():
+    db = TestingSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
 app.dependency_overrides[get_db] = _override_get_db
+app.dependency_overrides[get_read_db] = _override_get_read_db
 
 
 @pytest.fixture(autouse=True)

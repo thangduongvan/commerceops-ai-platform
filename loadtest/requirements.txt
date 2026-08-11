@@ -8,4 +8,6 @@ boto3>=1.34,<2.0
 
 # V5 (Reliability): chaos_experiment.py drives the app's HTTP API and the
 # stand-in gateway's /admin/chaos endpoint.
+# V6 (Database HA): ha_experiment.py uses the same HTTP client for lag /
+# failover drills (psql goes through `docker compose exec`, AWS via the CLI).
 httpx>=0.27,<1.0

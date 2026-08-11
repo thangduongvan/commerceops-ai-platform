@@ -324,3 +324,86 @@ resource "aws_cloudwatch_metric_alarm" "alb_unhealthy_hosts" {
 
   tags = var.tags
 }
+
+### V6 (Database HA): a Multi-AZ failover is invisible to every alarm above.
+### CPU is fine, the ALB sees 200s afterwards, the endpoint never changed —
+### RDS events are the only place that fact exists. Lives here (not in the
+### rds module) because the SNS topic is owned by this module and rds already
+### feeds identifiers into us; taking sns_topic_arn back into rds would create
+### a module dependency cycle. See docs/adr/ADR-007-database-ha.md.
+
+resource "aws_db_event_subscription" "rds" {
+  name      = "${var.name}-rds-events"
+  sns_topic = aws_sns_topic.alarms.arn
+
+  source_type = "db-instance"
+  source_ids  = compact([var.rds_instance_identifier, var.rds_replica_identifier])
+
+  event_categories = [
+    "failover",
+    "availability",
+    "deletion",
+    "failure",
+    "low storage",
+    "maintenance",
+  ]
+
+  tags = var.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "rds_replica_lag_high" {
+  count = var.rds_replica_identifier != null && var.rds_replica_identifier != "" ? 1 : 0
+
+  alarm_name          = "${var.name}-rds-replica-lag-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "ReplicaLag"
+  namespace           = "AWS/RDS"
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = var.rds_replica_lag_threshold_seconds
+  alarm_description   = "Read replica lag > ${var.rds_replica_lag_threshold_seconds}s — product reads may be serving stale data (see ADR-007)"
+  alarm_actions       = [aws_sns_topic.alarms.arn]
+  ok_actions          = [aws_sns_topic.alarms.arn]
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    DBInstanceIdentifier = var.rds_replica_identifier
+  }
+
+  tags = var.tags
+}
+
+### V6: application-level signal that the read replica path failed open to the
+### primary. Same log-metric-filter pattern as V5's circuit_breaker_open —
+### invisible to infrastructure metrics because the request still returns 200.
+
+resource "aws_cloudwatch_log_metric_filter" "read_replica_unavailable" {
+  name           = "${var.name}-read-replica-unavailable"
+  log_group_name = aws_cloudwatch_log_group.app.name
+  pattern        = "read_replica_unavailable"
+
+  metric_transformation {
+    name          = "ReadReplicaUnavailable"
+    namespace     = "CommerceOps/DatabaseHA"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "read_replica_unavailable" {
+  alarm_name          = "${var.name}-read-replica-unavailable"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "ReadReplicaUnavailable"
+  namespace           = "CommerceOps/DatabaseHA"
+  period              = 60
+  statistic           = "Sum"
+  threshold           = var.read_replica_unavailable_threshold
+  alarm_description   = "Product reads fell back from the replica to the primary more than ${var.read_replica_unavailable_threshold} times/min — the replica is down or unreachable, not merely lagging"
+  alarm_actions       = [aws_sns_topic.alarms.arn]
+  ok_actions          = [aws_sns_topic.alarms.arn]
+  treat_missing_data  = "notBreaching"
+
+  tags = var.tags
+}

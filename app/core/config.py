@@ -47,6 +47,31 @@ class Settings(BaseSettings):
     db_connect_timeout_seconds: int = 5
     db_statement_timeout_seconds: int = 5
 
+    # V6 (Database HA): optional asynchronous read replica for product GET
+    # endpoints. Assembled from DB_READ_HOST + the same credentials as the
+    # primary (physical replication shares them), or set wholesale via
+    # DATABASE_READ_URL under Docker Compose. When read_replica_enabled is
+    # false or no read URL/host is set, the read engine *is* the write
+    # engine — tests and single-DB local runs need no configuration.
+    # See docs/adr/ADR-007-database-ha.md.
+    database_read_url: Optional[str] = None
+    db_read_host: Optional[str] = None
+    read_replica_enabled: bool = False
+
+    # Bounds how long a pooled connection to a pre-failover primary can
+    # linger. pool_pre_ping already discards connections killed by a
+    # failover; recycle is the belt for connections that look fine to the
+    # client but point at a primary that no longer exists.
+    db_pool_recycle_seconds: int = 300
+
+    # Soft lag budget reported by /health/ready (does not fail the probe).
+    db_max_replica_lag_seconds: float = 5.0
+
+    # Short transient-error retry on *reads only* around a Multi-AZ failover.
+    # Writes fail fast — retrying a write whose commit outcome is unknown is
+    # the database version of V5's PAYMENT_PENDING problem.
+    db_transient_retry_attempts: int = 2
+
     # V3 (Caching): same "assemble from parts" pattern as the database URL
     # above. ECS injects REDIS_HOST/REDIS_PORT as plain (non-secret) env vars
     # — Redis has no AUTH/TLS in this setup, see docs/adr/ADR-004-caching.md.
@@ -166,6 +191,28 @@ class Settings(BaseSettings):
             self.database_url = (
                 f"postgresql+psycopg://{user}:{password}"
                 f"@{self.db_host}:{self.db_port}/{self.db_name}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _assemble_database_read_url_from_parts(self) -> "Settings":
+        # Prefer an explicitly set DATABASE_READ_URL (Compose). Otherwise,
+        # when ECS injects DB_READ_HOST alongside the primary's credentials,
+        # assemble a read URL that reuses them — a replica inherits the
+        # master password via physical replication.
+        if self.database_read_url:
+            return self
+        if (
+            self.db_read_host
+            and self.db_name
+            and self.db_username
+            and self.db_password
+        ):
+            user = quote_plus(self.db_username)
+            password = quote_plus(self.db_password)
+            self.database_read_url = (
+                f"postgresql+psycopg://{user}:{password}"
+                f"@{self.db_read_host}:{self.db_port}/{self.db_name}"
             )
         return self
 

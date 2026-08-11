@@ -43,13 +43,27 @@ def test_health_does_not_touch_any_dependency(client, monkeypatch):
 def test_readiness_reports_every_dependency(client):
     body = client.get("/health/ready").json()
 
+    # V6 adds database_replica (informational; required=False).
     assert set(body["checks"]) == {
         "database",
         "redis",
         "queue",
         "payment_gateway",
+        "database_replica",
     }
     assert "status" in body
+
+
+def test_readiness_reports_database_replica_disabled_when_not_configured(client):
+    replica = client.get("/health/ready").json()["checks"]["database_replica"]
+
+    # Default test settings leave read_replica_enabled=False. A missing replica
+    # must not mark the process degraded — product reads fall open to the
+    # primary, and order/customer never use it.
+    assert replica["required"] is False
+    assert replica.get("enabled") is False
+    assert replica["ok"] is True
+    assert replica["lag_seconds"] is None
 
 
 def test_readiness_returns_200_while_reporting_degraded(client):

@@ -250,3 +250,59 @@ variable "worker_handler_retry_attempts" {
   type        = number
   default     = 3
 }
+
+# V6 — Database HA (see docs/adr/ADR-007-database-ha.md)
+#
+# Multi-AZ roughly doubles the RDS instance cost; the replica adds a third.
+# Defaults are the safe/learning ones. For cheap terraform destroy cycles set
+# rds_multi_az=false, rds_read_replica_enabled=false,
+# rds_deletion_protection=false, rds_skip_final_snapshot=true — see
+# docs/deployment.md §10.
+
+variable "rds_multi_az" {
+  description = "Synchronous standby in another AZ. RPO ≈ 0 for AZ/instance failure; ~2x instance cost."
+  type        = bool
+  default     = true
+}
+
+variable "rds_deletion_protection" {
+  description = "Block accidental deletion. Teardown is then two steps (disable, then destroy)."
+  type        = bool
+  default     = true
+}
+
+variable "rds_skip_final_snapshot" {
+  description = "When false, take a final snapshot on destroy."
+  type        = bool
+  default     = false
+}
+
+variable "rds_read_replica_enabled" {
+  description = "Create an asynchronous same-region read replica for product-read scaling. Not an HA mechanism."
+  type        = bool
+  default     = true
+}
+
+variable "rds_replica_instance_class" {
+  description = "Instance class for the read replica"
+  type        = string
+  default     = "db.t3.micro"
+}
+
+variable "rds_replica_lag_threshold_seconds" {
+  description = "ReplicaLag (seconds) above which the CloudWatch alarm fires"
+  type        = number
+  default     = 30
+}
+
+variable "read_replica_unavailable_threshold" {
+  description = "App log lines of read_replica_unavailable per minute before alarming"
+  type        = number
+  default     = 5
+}
+
+variable "db_pool_recycle_seconds" {
+  description = "SQLAlchemy pool_recycle — bounds how long a pooled connection to a pre-failover primary can linger"
+  type        = number
+  default     = 300
+}
