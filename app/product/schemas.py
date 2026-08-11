@@ -27,3 +27,27 @@ class ProductRead(BaseModel):
     stock_quantity: int
     created_at: datetime
     updated_at: datetime
+
+
+# V7: internal stock APIs called by the Order service over HTTP.
+class StockItemRequest(BaseModel):
+    product_id: int
+    quantity: int = Field(gt=0)
+
+
+class StockReserveRequest(BaseModel):
+    items: list[StockItemRequest] = Field(min_length=1)
+
+
+class StockReservedItem(BaseModel):
+    product_id: int
+    quantity: int
+    unit_price: float
+
+
+class StockReserveResponse(BaseModel):
+    items: list[StockReservedItem]
+
+
+class StockReleaseRequest(BaseModel):
+    items: list[StockItemRequest] = Field(min_length=1)

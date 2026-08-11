@@ -38,9 +38,16 @@ variable "ecs_cluster_name" {
   type        = string
 }
 
+variable "ecs_service_names" {
+  description = "ECS service names the GitHub Actions role may redeploy (V7: product/order/payment/worker)"
+  type        = list(string)
+  default     = []
+}
+
 variable "ecs_service_name" {
-  description = "Name of the ECS service (used to scope the GitHub Actions deploy role, created by the ecs module)"
+  description = "Deprecated single-service name; prefer ecs_service_names. Kept optional for older callers."
   type        = string
+  default     = ""
 }
 
 variable "github_repo" {

@@ -6,7 +6,15 @@ locals {
   # they can build ARNs / alarm dimensions without depending on the ecs module
   # itself (avoids a module dependency cycle: ecs depends on iam and cloudwatch).
   ecs_cluster_name = "${local.name}-cluster"
-  ecs_service_name = "${local.name}-app"
+  # V7: GitHub Actions / cloudwatch primarily track the Product service
+  # (read-heavy flash-sale path). Deploy redeploys all four services.
+  ecs_service_name = "${local.name}-product"
+  ecs_service_names = [
+    "${local.name}-product",
+    "${local.name}-order",
+    "${local.name}-payment",
+    "${local.name}-worker",
+  ]
 
   tags = {
     Project     = var.project_name
@@ -105,6 +113,7 @@ module "iam" {
   ecr_repository_arn    = module.ecr.repository_arn
   ecs_cluster_name      = local.ecs_cluster_name
   ecs_service_name      = local.ecs_service_name
+  ecs_service_names     = local.ecs_service_names
   github_repo           = var.github_repo
   github_branch         = var.github_branch
   tags                  = local.tags
@@ -160,18 +169,24 @@ module "ecs" {
   cpu                = var.ecs_cpu
   memory             = var.ecs_memory
   desired_count      = var.ecs_desired_count
-  execution_role_arn = module.iam.ecs_task_execution_role_arn
-  task_role_arn      = module.iam.ecs_task_role_arn
-  target_group_arn   = module.alb.target_group_arn
-  log_group_name     = module.cloudwatch.log_group_name
-  rds_secret_arn     = module.rds.master_user_secret_arn
-  db_host            = module.rds.address
-  db_port            = module.rds.port
-  db_name            = module.rds.db_name
-  redis_host         = module.elasticache.address
-  redis_port         = module.elasticache.port
-  cache_ttl_seconds  = var.cache_ttl_seconds
-  cache_enabled      = var.cache_enabled
+  execution_role_arn         = module.iam.ecs_task_execution_role_arn
+  task_role_arn              = module.iam.ecs_task_role_arn
+  product_target_group_arn   = module.alb.product_target_group_arn
+  order_target_group_arn     = module.alb.order_target_group_arn
+  payment_target_group_arn   = module.alb.payment_target_group_arn
+  log_group_name             = module.cloudwatch.log_group_name
+  rds_secret_arn             = module.rds.master_user_secret_arn
+  db_host                    = module.rds.address
+  db_port                    = module.rds.port
+  db_name                    = module.rds.db_name
+  product_db_name            = var.product_db_name
+  order_db_name              = var.order_db_name
+  payment_db_name            = var.payment_db_name
+  payment_desired_count      = var.payment_desired_count
+  redis_host                 = module.elasticache.address
+  redis_port                 = module.elasticache.port
+  cache_ttl_seconds          = var.cache_ttl_seconds
+  cache_enabled              = var.cache_enabled
 
   sqs_queue_name           = module.sqs.queue_name
   worker_task_role_arn     = module.iam.ecs_worker_task_role_arn

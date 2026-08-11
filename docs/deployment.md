@@ -506,9 +506,43 @@ terraform apply -var="rds_deletion_protection=false" -var="rds_skip_final_snapsh
 terraform destroy
 ```
 
-Or set both in `terraform.tfvars` before destroy. Leaving the bootstrap state bucket in place is still recommended (step 11 below).
+Or set both in `terraform.tfvars` before destroy. Leaving the bootstrap state bucket in place is still recommended (step 12 below).
 
-## 11. Wire up GitHub Actions CI/CD
+## 11. V7: Microservices
+
+Product / Order / Payment run as separate ECS services (and Compose services) with database-per-service. See [ADR-008](adr/ADR-008-microservices.md).
+
+### Local
+
+```powershell
+cd commerceops-ai-platform
+docker compose up --build -d
+# Gateway: http://localhost:8000
+# Product :8001  Order :8002  Payment :8003
+curl http://localhost:8000/health
+curl http://localhost:8000/products
+```
+
+Fault-isolation drill:
+
+```powershell
+$env:APP_URL = "http://localhost:8000"
+python loadtest/microservices_experiment.py fault-isolation
+python loadtest/microservices_experiment.py compare-latency
+python loadtest/microservices_experiment.py checklist
+```
+
+### AWS shape
+
+* **ALB**: path rules `/products*` + `/internal*` → Product TG; `/payments*` → Payment TG; default → Order TG.
+* **ECS**: `*-product`, `*-order`, `*-payment`, `*-worker` services; Payment keeps the fake-gateway sidecar.
+* **Service Connect**: namespace `${name}.local`; Order uses `PRODUCT_SERVICE_URL=http://product:8000` and `PAYMENT_SERVICE_URL=http://payment:8000`.
+* **RDS**: bootstrap DB `commerceops`; each task sets `DB_NAME=commerceops_product|order|payment` and `ensure_database` creates the logical DB on first boot. Master user needs `CREATEDB` (default on RDS).
+* **CI**: set GitHub variable `ECS_SERVICES` to a comma-separated list of the four service names (or rely on the workflow's derivation from `ECS_SERVICE`).
+
+After `terraform apply`, force redeploys of all four services once the image is in ECR (same as V1 step 4, but four services).
+
+## 12. Wire up GitHub Actions CI/CD
 
 In the GitHub repo: **Settings → Secrets and variables → Actions → Variables**, add:
 
@@ -518,11 +552,12 @@ In the GitHub repo: **Settings → Secrets and variables → Actions → Variabl
 | `AWS_REGION` | `us-east-1` (or whatever you used) |
 | `ECR_REPOSITORY` | `commerceops-dev-app` |
 | `ECS_CLUSTER` | `terraform -chdir=infra/environments/dev output -raw ecs_cluster_name` |
-| `ECS_SERVICE` | `terraform -chdir=infra/environments/dev output -raw ecs_service_name` |
+| `ECS_SERVICE` | Product service name (legacy fallback for the workflow) |
+| `ECS_SERVICES` | `commerceops-dev-product,commerceops-dev-order,commerceops-dev-payment,commerceops-dev-worker` |
 
-No AWS access keys are stored in GitHub — [.github/workflows/deploy.yml](../.github/workflows/deploy.yml) assumes `AWS_ROLE_ARN` via GitHub's OIDC token. From now on, pushes to `main` touching `app/**`/`Dockerfile` automatically build, push, and redeploy.
+No AWS access keys are stored in GitHub — [.github/workflows/deploy.yml](../.github/workflows/deploy.yml) assumes `AWS_ROLE_ARN` via GitHub's OIDC token. From now on, pushes to `main` touching `app/**`/`Dockerfile` automatically build, push, and redeploy all four ECS services.
 
-## 12. Cost control: tear it down when you're done
+## 13. Cost control: tear it down when you're done
 
 Per the learning project's "deploy → test → destroy" principle (avoid paying for idle ALB/NAT/RDS/ElastiCache/Multi-AZ/replica between sessions).
 
@@ -533,20 +568,18 @@ cd infra/environments/dev
 terraform destroy
 ```
 
-Leave the `infra/bootstrap` state bucket/lock table in place (they cost effectively nothing) so you don't have to redo step 1 next time. Re-running steps 3–10 later recreates everything from the same Terraform code.
+Leave the `infra/bootstrap` state bucket/lock table in place (they cost effectively nothing) so you don't have to redo step 1 next time. Re-running steps 3–11 later recreates everything from the same Terraform code.
 
 ## Troubleshooting
 
 * **Tasks stuck in `PENDING`/`STOPPED` immediately after `terraform apply`**: expected before step 4 — no image in ECR yet. Check `aws ecs describe-tasks` / the CloudWatch log group for the actual failure reason if it persists after pushing an image.
-* **ALB returns 503**: target group has no healthy targets yet — check ECS service events (`aws ecs describe-services --cluster ... --services ...`) and the `/health` path/port match the app's actual listen port (8000).
+* **ALB returns 503**: target group has no healthy targets yet — check ECS service events for `product` / `order` / `payment` and the `/health` path/port match (8000).
 * **`terraform init` backend error**: double check `backend.tf` has the exact bucket/table names from `infra/bootstrap` outputs, and that your AWS credentials can access them.
 * **Products endpoints work but seem to ignore recent writes**: check `CACHE_ENABLED` — if `true`, `GET /products` listings are only guaranteed fresh within `cache_ttl_seconds` (see [ADR-004](adr/ADR-004-caching.md)'s "how do you invalidate the cache?"). `GET /products/{id}` is invalidated immediately on update, so if that's stale too, check the app logs for `cache_get_json`/`cache_delete` warnings — likely Redis is unreachable and every request is silently falling back to Postgres.
-* **Orders succeed but the worker never logs notification/analytics/email/search lines**: check `docker compose logs app` for `publish_event failed` warnings (queue unreachable — often `localstack` not yet healthy when `app` started) and `docker compose logs localstack` for whether `create-queues.sh` actually ran (look for "V4/V5: order-events queue + DLQ ready on LocalStack"). In AWS, check the worker task's CloudWatch logs and confirm its IAM role has `sqs:ReceiveMessage` **and `sqs:GetQueueUrl`** on the queue — the worker resolves the queue name to a URL at runtime, so a policy missing `GetQueueUrl` fails only in AWS, since LocalStack doesn't enforce IAM ([ADR-006](adr/ADR-006-reliability.md)).
-* **Every order comes back `PAYMENT_PENDING` (V5)**: the app can't reach the payment gateway at all. Check `curl http://localhost:8000/health/ready` — `payment_gateway.reachable` will be `false`. Locally that usually means `PAYMENT_GATEWAY_URL` still points at `payment-gateway:9000` while the app is running outside Compose (use `localhost:9000`); in AWS, check the sidecar's `payment-gateway` log stream. If `reachable` is `true` but `circuit_state` is `OPEN`, the breaker is deliberately refusing calls and will probe again after 30s.
-* **Orders return `PAYMENT_PENDING` with `reason: bulkhead_full` under load (V5)**: expected behaviour, not a bug — the payment gateway is slow enough that 10 calls are already in flight, so further orders are shed to protect the rest of the app. If it happens without the gateway being slow, `PAYMENT_BULKHEAD_MAX_CONCURRENCY` is set too low for the traffic.
-* **The worker stops making progress and logs database errors (V5)**: V5 gave the worker a Postgres dependency (`processed_events`), which V4 didn't have. Locally, make sure `db` is running and `DATABASE_URL` is set on the worker service. In AWS, confirm the RDS security group allows ingress from the *worker* security group, not just the app's ([infra/modules/security_groups](../infra/modules/security_groups)).
-* **A message is redelivered while a worker is still processing it (V5)**: the visibility timeout is shorter than the worker's retry budget. `SQS_VISIBILITY_TIMEOUT_SECONDS` (60s), the queue's actual `VisibilityTimeout`, and `infra/localstack/create-queues.sh` all have to agree — check with `awslocal sqs get-queue-attributes --attribute-names VisibilityTimeout`.
-* **`db-replica` never becomes healthy (V6)**: the primary's init script only runs on a *fresh* data volume. If you added replication to an existing `db_data` volume, recreate with `docker compose down -v && docker compose up -d`. Also check `docker compose logs db-replica` for `pg_basebackup` auth failures — the `replicator` role and `host replication ...` pg_hba line come from `infra/postgres/init-replication.sh`.
-* **Product GETs look stale right after a PUT (V6)**: expected under replica lag (and under the existing Redis TTL). `/health/ready` → `checks.database_replica.lag_seconds` shows the current lag. Orders and customers are not affected — they stay on the primary. See [ADR-007](adr/ADR-007-database-ha.md).
-* **`terraform destroy` fails on the RDS instance (V6)**: `deletion_protection` is on. Follow §10.7 (disable protection, then destroy).
-* **Failover drill reports RPO > 0 on Multi-AZ (V6)**: unexpected — Multi-AZ commit is synchronous. Confirm `MultiAZ = true` via `aws rds describe-db-instances`, and that you used `--force-failover` (a plain reboot on single-AZ is just a restart, not a failover).
+* **Orders succeed but the worker never logs notification/analytics/email/search lines**: check `docker compose logs order` for `publish_event failed` warnings and `docker compose logs localstack` for whether `create-queues.sh` ran. In AWS, confirm the worker IAM role has `sqs:ReceiveMessage` **and `sqs:GetQueueUrl`**.
+* **Every order comes back `PAYMENT_PENDING` (V5)**: Order can't reach Payment, or Payment can't reach the gateway. Check Order `/health/ready` → `payment_service`, and Payment `/health/ready` → `payment_gateway`.
+* **Orders return 503 mentioning Product service (V7)**: Product is down or unreachable via Service Connect / Compose DNS. Run `python loadtest/microservices_experiment.py fault-isolation` to see the intended behaviour.
+* **`db-replica` / `product-db-replica` never becomes healthy**: recreate volumes with `docker compose down -v && docker compose up -d`. Init scripts live under `infra/postgres/product/`.
+* **Product GETs look stale right after a PUT (V6)**: expected under replica lag (and Redis TTL). See [ADR-007](adr/ADR-007-database-ha.md).
+* **`terraform destroy` fails on the RDS instance (V6)**: `deletion_protection` is on. Follow §10.7.
+* **Failover drill reports RPO > 0 on Multi-AZ (V6)**: unexpected — confirm `MultiAZ = true` and `--force-failover`.

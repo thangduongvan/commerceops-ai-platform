@@ -163,3 +163,53 @@ def update_product(db: Session, product_id: int, payload: ProductUpdate) -> Prod
     # the next read is guaranteed fresh instead of waiting out the TTL.
     cache_delete(_product_cache_key(product_id))
     return product
+
+
+def reserve_stock(
+    db: Session, items: list[tuple[int, int]]
+) -> list[dict]:
+    """V7: atomically check + decrement stock for an order's line items.
+
+    Runs in one Product-DB transaction so concurrent reserves cannot oversell.
+    Returns unit prices so Order can persist line totals without reading the
+    Product table (database-per-service — Order has no Product model).
+    """
+    reserved: list[dict] = []
+    # Lock rows in id order to avoid deadlocks between concurrent reserves.
+    for product_id, quantity in sorted(items, key=lambda x: x[0]):
+        product = db.get(Product, product_id, with_for_update=True)
+        if product is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Product {product_id} not found",
+            )
+        if product.stock_quantity < quantity:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Insufficient stock for product {product_id}",
+            )
+        product.stock_quantity -= quantity
+        reserved.append(
+            {
+                "product_id": product_id,
+                "quantity": quantity,
+                "unit_price": float(product.price),
+            }
+        )
+        cache_delete(_product_cache_key(product_id))
+    db.commit()
+    return reserved
+
+
+def release_stock(db: Session, items: list[tuple[int, int]]) -> None:
+    """V7: compensating restock after payment FAILED or order cancel."""
+    for product_id, quantity in sorted(items, key=lambda x: x[0]):
+        product = db.get(Product, product_id, with_for_update=True)
+        if product is None:
+            # Product deleted after reserve — log and continue; stock can't
+            # be restored onto a missing SKU.
+            logger.warning("release_stock_missing product_id=%s", product_id)
+            continue
+        product.stock_quantity += quantity
+        cache_delete(_product_cache_key(product_id))
+    db.commit()

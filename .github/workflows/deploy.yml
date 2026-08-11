@@ -41,21 +41,45 @@ jobs:
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
 
-      # The ECS task definition always references the ":latest" tag (see
-      # infra/modules/ecs), so a redeploy just needs to force ECS to launch
-      # new tasks, which re-pulls the image that was just pushed above.
-      # Trade-off (documented in ADR-002): no per-deploy task-definition
-      # revision history / one-click rollback — acceptable for a V1 learning
-      # project, revisit if this becomes a real concern.
-      - name: Force new ECS deployment
+      # V7: same image, four ECS services (product / order / payment / worker).
+      # Task defs still reference ":latest"; force-new-deployment re-pulls.
+      - name: Force new ECS deployments
+        env:
+          CLUSTER: ${{ vars.ECS_CLUSTER }}
+          # Comma-separated; set ECS_SERVICES in repo vars, or fall back to
+          # the legacy single ECS_SERVICE plus conventional suffixes.
+          SERVICES: ${{ vars.ECS_SERVICES }}
+          LEGACY_SERVICE: ${{ vars.ECS_SERVICE }}
         run: |
-          aws ecs update-service \
-            --cluster "${{ vars.ECS_CLUSTER }}" \
-            --service "${{ vars.ECS_SERVICE }}" \
-            --force-new-deployment
+          if [ -n "$SERVICES" ]; then
+            IFS=',' read -ra SVCS <<< "$SERVICES"
+          else
+            # Derive product/order/payment/worker from a product (or app) name.
+            BASE="${LEGACY_SERVICE%-product}"
+            BASE="${BASE%-app}"
+            SVCS=("${BASE}-product" "${BASE}-order" "${BASE}-payment" "${BASE}-worker")
+          fi
+          for svc in "${SVCS[@]}"; do
+            echo "Redeploying $svc ..."
+            aws ecs update-service \
+              --cluster "$CLUSTER" \
+              --service "$svc" \
+              --force-new-deployment
+          done
 
-      - name: Wait for service to stabilize
+      - name: Wait for services to stabilize
+        env:
+          CLUSTER: ${{ vars.ECS_CLUSTER }}
+          SERVICES: ${{ vars.ECS_SERVICES }}
+          LEGACY_SERVICE: ${{ vars.ECS_SERVICE }}
         run: |
+          if [ -n "$SERVICES" ]; then
+            IFS=',' read -ra SVCS <<< "$SERVICES"
+          else
+            BASE="${LEGACY_SERVICE%-product}"
+            BASE="${BASE%-app}"
+            SVCS=("${BASE}-product" "${BASE}-order" "${BASE}-payment" "${BASE}-worker")
+          fi
           aws ecs wait services-stable \
-            --cluster "${{ vars.ECS_CLUSTER }}" \
-            --services "${{ vars.ECS_SERVICE }}"
+            --cluster "$CLUSTER" \
+            --services "${SVCS[@]}"

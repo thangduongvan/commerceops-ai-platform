@@ -18,7 +18,7 @@ class Base(DeclarativeBase):
 
     All modules mapping to tables (customer, product, order, ...) register
     on this single metadata object, since V0 is one process with one
-    database (database-per-service comes later, at V7).
+    database (database-per-service is V7 — see ADR-008).
     """
 
 

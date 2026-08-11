@@ -207,9 +207,16 @@ data "aws_iam_policy_document" "github_actions_deploy" {
   }
 
   statement {
-    sid       = "EcsRedeploy"
-    actions   = ["ecs:UpdateService", "ecs:DescribeServices"]
-    resources = ["arn:aws:ecs:${var.region}:${data.aws_caller_identity.current.account_id}:service/${var.ecs_cluster_name}/${var.ecs_service_name}"]
+    sid     = "EcsRedeploy"
+    actions = ["ecs:UpdateService", "ecs:DescribeServices"]
+    resources = [
+      for svc in (
+        length(var.ecs_service_names) > 0
+        ? var.ecs_service_names
+        : [var.ecs_service_name]
+      ) :
+      "arn:aws:ecs:${var.region}:${data.aws_caller_identity.current.account_id}:service/${var.ecs_cluster_name}/${svc}"
+    ]
   }
 
   statement {

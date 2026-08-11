@@ -1,5 +1,7 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
 
+from app.core.database import get_db
 from app.payment import service
 from app.payment.schemas import PaymentRequest, PaymentResult
 
@@ -7,12 +9,10 @@ router = APIRouter(prefix="/payments", tags=["payments"])
 
 
 @router.post("", response_model=PaymentResult, status_code=201)
-def create_payment(payload: PaymentRequest):
-    """Standalone endpoint for the fake payment provider.
+def create_payment(payload: PaymentRequest, db: Session = Depends(get_db)):
+    """Charge endpoint owned by the Payment service (V7).
 
-    The order module also calls `service.charge` directly in-process
-    (monolith == no network hop needed), but exposing this endpoint
-    documents the external contract this provider will have once it is
-    a real, separately-deployed system.
+    Order calls this over HTTP; public clients may also hit it via the
+    gateway's `/payments` path.
     """
-    return service.charge(payload)
+    return service.charge(db, payload)

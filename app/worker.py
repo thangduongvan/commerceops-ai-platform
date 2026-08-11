@@ -271,4 +271,11 @@ def run_worker(max_iterations: Optional[int] = None) -> None:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
+    # V7: worker shares the Order service database (processed_events).
+    from app.core import models as _core_models  # noqa: F401
+    from app.core.database import Base, engine
+    from app.core.ensure_database import ensure_database
+
+    ensure_database(settings.database_url)
+    Base.metadata.create_all(bind=engine, tables=[_core_models.ProcessedEvent.__table__])
     run_worker()

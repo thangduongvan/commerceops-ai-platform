@@ -1,20 +1,14 @@
-# V0 Database Schema
+# Database Schema (V7 — database-per-service)
 
-Single PostgreSQL database, shared by all modules (database-per-service is introduced later, at V7).
+Each service owns its PostgreSQL database. There are **no cross-database foreign keys**. `order_items.product_id` is a logical reference only.
+
+Locally: three Compose Postgres containers (`product-db`, `order-db`, `payment-db`) plus `product-db-replica`.  
+AWS: three logical databases on one RDS instance (`commerceops_product`, `commerceops_order`, `commerceops_payment`), created at startup by [`app/core/ensure_database.py`](../app/core/ensure_database.py).
+
+## Product DB (`commerceops_product`)
 
 ```mermaid
 erDiagram
-    customers ||--o{ orders : places
-    orders ||--o{ order_items : contains
-    products ||--o{ order_items : "referenced by"
-
-    customers {
-        int id PK
-        string name
-        string email
-        datetime created_at
-    }
-
     products {
         int id PK
         string name
@@ -23,6 +17,23 @@ erDiagram
         int stock_quantity
         datetime created_at
         datetime updated_at
+    }
+```
+
+Stock mutations for orders go through `POST /internal/stock/reserve` and `/release` (Product service), not through Order's database.
+
+## Order DB (`commerceops_order`)
+
+```mermaid
+erDiagram
+    customers ||--o{ orders : places
+    orders ||--o{ order_items : contains
+
+    customers {
+        int id PK
+        string name
+        string email
+        datetime created_at
     }
 
     orders {
@@ -37,7 +48,7 @@ erDiagram
     order_items {
         int id PK
         int order_id FK
-        int product_id FK
+        int product_id "logical ref to Product service"
         int quantity
         numeric unit_price
     }
@@ -51,9 +62,28 @@ erDiagram
     }
 ```
 
+`processed_events` is written by the Order **worker** (same DB). See [ADR-006](adr/ADR-006-reliability.md).
+
+## Payment DB (`commerceops_payment`)
+
+```mermaid
+erDiagram
+    payments {
+        int id PK
+        int order_id UK
+        numeric amount
+        string status
+        string transaction_id
+        string reason
+        datetime created_at
+    }
+```
+
+`order_id` is the idempotency key: a retried charge returns the stored row.
+
 ## Notes
 
-* `order_items.unit_price` is copied from `products.price` at order creation time, so historical orders are unaffected by later price changes.
+* `order_items.unit_price` is copied from Product's reserve response at order time.
 * `orders.status` is one of `PENDING`, `PAID`, `PAYMENT_FAILED`, `PAYMENT_PENDING` (V5), `CANCELLED`.
-* **`processed_events` (V5)** has no foreign keys and no relationship to the domain tables — it's infrastructure, not a domain entity ([app/core/models.py](../app/core/models.py)). One row per `(event_id, handler_name)` pair that has *completed*, with a unique constraint on the pair. It's the durable record that a given side effect already ran, making SQS's at-least-once delivery safe to reprocess. It lives in Postgres rather than Redis because a record that can be evicted or lost on restart cannot be the only thing preventing a duplicate charge — see [ADR-006](adr/ADR-006-reliability.md). It grows by (events × handlers) and has no cleanup yet; a retention job becomes necessary at real volume.
-* No migration tool (e.g. Alembic) is used in V0 — `Base.metadata.create_all()` runs on app startup. This is a deliberate simplification (see [ADR-001](adr/ADR-001-modular-monolith.md)); a real migration tool becomes necessary once the schema needs to evolve without dropping data.
+* Still no Alembic — each service runs scoped `Base.metadata.create_all(..., tables=[...])` on startup.
+* See [ADR-008](adr/ADR-008-microservices.md).

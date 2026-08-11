@@ -12,7 +12,20 @@ output "ecs_cluster_name" {
 }
 
 output "ecs_service_name" {
-  value = module.ecs.service_name
+  description = "Primary (Product) service name — used by autoscaling / alarms"
+  value       = module.ecs.service_name
+}
+
+output "ecs_product_service_name" {
+  value = module.ecs.product_service_name
+}
+
+output "ecs_order_service_name" {
+  value = module.ecs.order_service_name
+}
+
+output "ecs_payment_service_name" {
+  value = module.ecs.payment_service_name
 }
 
 output "rds_endpoint" {

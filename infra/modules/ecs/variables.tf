@@ -49,7 +49,15 @@ variable "task_role_arn" {
   type = string
 }
 
-variable "target_group_arn" {
+variable "product_target_group_arn" {
+  type = string
+}
+
+variable "order_target_group_arn" {
+  type = string
+}
+
+variable "payment_target_group_arn" {
   type = string
 }
 
@@ -71,7 +79,33 @@ variable "db_port" {
 }
 
 variable "db_name" {
-  type = string
+  description = "Bootstrap RDS database name (unused by services; kept for compatibility)"
+  type        = string
+  default     = "commerceops"
+}
+
+# V7: logical databases on the shared RDS instance (created at runtime via
+# app/core/ensure_database.py). Instance-per-service is the production
+# isolation pattern — see ADR-008.
+variable "product_db_name" {
+  type    = string
+  default = "commerceops_product"
+}
+
+variable "order_db_name" {
+  type    = string
+  default = "commerceops_order"
+}
+
+variable "payment_db_name" {
+  type    = string
+  default = "commerceops_payment"
+}
+
+variable "payment_desired_count" {
+  description = "Initial Payment service task count (smaller than Product/Order)"
+  type        = number
+  default     = 1
 }
 
 variable "redis_host" {

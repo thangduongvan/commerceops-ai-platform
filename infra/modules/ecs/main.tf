@@ -1,3 +1,13 @@
+### V7 (Microservices): Product / Order / Payment ECS services + worker.
+### Service Connect provides DNS discovery (product / payment hostnames) for
+### Order's sync HTTP clients. See docs/adr/ADR-008-microservices.md.
+
+resource "aws_service_discovery_http_namespace" "this" {
+  name        = "${var.name}.local"
+  description = "V7 Service Connect namespace for CommerceOps microservices"
+  tags        = var.tags
+}
+
 resource "aws_ecs_cluster" "this" {
   name = "${var.name}-cluster"
 
@@ -6,11 +16,40 @@ resource "aws_ecs_cluster" "this" {
     value = "enabled"
   }
 
+  service_connect_defaults {
+    namespace = aws_service_discovery_http_namespace.this.arn
+  }
+
   tags = merge(var.tags, { Name = "${var.name}-cluster" })
 }
 
-resource "aws_ecs_task_definition" "app" {
-  family                   = "${var.name}-app"
+locals {
+  common_secrets = [
+    { name = "DB_USERNAME", valueFrom = "${var.rds_secret_arn}:username::" },
+    { name = "DB_PASSWORD", valueFrom = "${var.rds_secret_arn}:password::" },
+  ]
+
+  reliability_env = [
+    { name = "PAYMENT_CONNECT_TIMEOUT_SECONDS", value = tostring(var.payment_connect_timeout_seconds) },
+    { name = "PAYMENT_READ_TIMEOUT_SECONDS", value = tostring(var.payment_read_timeout_seconds) },
+    { name = "PAYMENT_RETRY_ATTEMPTS", value = tostring(var.payment_retry_attempts) },
+    { name = "RETRY_BASE_DELAY_SECONDS", value = tostring(var.retry_base_delay_seconds) },
+    { name = "RETRY_MAX_DELAY_SECONDS", value = tostring(var.retry_max_delay_seconds) },
+    { name = "CIRCUIT_BREAKER_FAILURE_THRESHOLD", value = tostring(var.circuit_breaker_failure_threshold) },
+    { name = "CIRCUIT_BREAKER_RECOVERY_SECONDS", value = tostring(var.circuit_breaker_recovery_seconds) },
+    { name = "PAYMENT_BULKHEAD_MAX_CONCURRENCY", value = tostring(var.payment_bulkhead_max_concurrency) },
+    { name = "DB_CONNECT_TIMEOUT_SECONDS", value = tostring(var.db_connect_timeout_seconds) },
+    { name = "DB_STATEMENT_TIMEOUT_SECONDS", value = tostring(var.db_statement_timeout_seconds) },
+    { name = "DB_POOL_RECYCLE_SECONDS", value = tostring(var.db_pool_recycle_seconds) },
+  ]
+}
+
+# ---------------------------------------------------------------------------
+# Product
+# ---------------------------------------------------------------------------
+
+resource "aws_ecs_task_definition" "product" {
+  family                   = "${var.name}-product"
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
   cpu                      = var.cpu
@@ -20,91 +59,148 @@ resource "aws_ecs_task_definition" "app" {
 
   container_definitions = jsonencode([
     {
-      name      = "app"
+      name      = "product"
       image     = var.image
       essential = true
+      command   = ["uvicorn", "app.product.main:app", "--host", "0.0.0.0", "--port", tostring(var.container_port)]
 
       portMappings = [
         {
           containerPort = var.container_port
           protocol      = "tcp"
+          name          = "http"
+          appProtocol   = "http"
         }
       ]
 
-      environment = [
-        { name = "APP_NAME", value = var.app_name },
-        { name = "ENVIRONMENT", value = var.environment },
-        { name = "DB_HOST", value = var.db_host },
-        { name = "DB_PORT", value = tostring(var.db_port) },
-        { name = "DB_NAME", value = var.db_name },
-        # V3 (Caching): no `secrets` entry needed here — this ElastiCache
-        # cluster has no AUTH token/TLS (see docs/adr/ADR-004-caching.md),
-        # so host/port are as safe to log/inspect as DB_HOST/DB_PORT above.
-        { name = "REDIS_HOST", value = var.redis_host },
-        { name = "REDIS_PORT", value = tostring(var.redis_port) },
-        { name = "CACHE_TTL_SECONDS", value = tostring(var.cache_ttl_seconds) },
-        { name = "CACHE_ENABLED", value = tostring(var.cache_enabled) },
-        # V4 (Asynchronous Processing): no SQS_ENDPOINT_URL here — unset
-        # means boto3 talks to the real regional SQS endpoint, authenticated
-        # via this task's own IAM role (var.task_role_arn), no static keys.
-        { name = "AWS_REGION", value = var.region },
-        { name = "SQS_QUEUE_NAME", value = var.sqs_queue_name },
-        { name = "SQS_VISIBILITY_TIMEOUT_SECONDS", value = tostring(var.sqs_visibility_timeout_seconds) },
-        # V5 (Reliability): localhost, because the payment gateway runs as a
-        # sidecar in this same task (below) and awsvpc network mode gives the
-        # containers in a task a shared network namespace. Under Docker Compose
-        # this is http://payment-gateway:9000 — the only value that differs
-        # between the two environments, the same shape as SQS_ENDPOINT_URL.
-        { name = "PAYMENT_GATEWAY_URL", value = "http://localhost:${var.payment_gateway_port}" },
-        { name = "PAYMENT_CONNECT_TIMEOUT_SECONDS", value = tostring(var.payment_connect_timeout_seconds) },
-        { name = "PAYMENT_READ_TIMEOUT_SECONDS", value = tostring(var.payment_read_timeout_seconds) },
-        { name = "PAYMENT_RETRY_ATTEMPTS", value = tostring(var.payment_retry_attempts) },
-        { name = "RETRY_BASE_DELAY_SECONDS", value = tostring(var.retry_base_delay_seconds) },
-        { name = "RETRY_MAX_DELAY_SECONDS", value = tostring(var.retry_max_delay_seconds) },
-        { name = "CIRCUIT_BREAKER_FAILURE_THRESHOLD", value = tostring(var.circuit_breaker_failure_threshold) },
-        { name = "CIRCUIT_BREAKER_RECOVERY_SECONDS", value = tostring(var.circuit_breaker_recovery_seconds) },
-        { name = "PAYMENT_BULKHEAD_MAX_CONCURRENCY", value = tostring(var.payment_bulkhead_max_concurrency) },
-        { name = "DB_CONNECT_TIMEOUT_SECONDS", value = tostring(var.db_connect_timeout_seconds) },
-        { name = "DB_STATEMENT_TIMEOUT_SECONDS", value = tostring(var.db_statement_timeout_seconds) },
-        # V6 (Database HA): product reads may go to the asynchronous replica.
-        # Credentials are shared with the primary (physical replication), so
-        # only the host differs. Empty DB_READ_HOST + READ_REPLICA_ENABLED=false
-        # makes the app use the primary for everything — same shape as the
-        # local Compose default when the standby is not running.
-        { name = "DB_READ_HOST", value = coalesce(var.db_read_host, "") },
-        { name = "READ_REPLICA_ENABLED", value = tostring(var.read_replica_enabled && var.db_read_host != null && var.db_read_host != "") },
-        { name = "DB_POOL_RECYCLE_SECONDS", value = tostring(var.db_pool_recycle_seconds) },
-      ]
+      environment = concat(
+        [
+          { name = "SERVICE_NAME", value = "product" },
+          { name = "APP_NAME", value = var.app_name },
+          { name = "ENVIRONMENT", value = var.environment },
+          { name = "DB_HOST", value = var.db_host },
+          { name = "DB_PORT", value = tostring(var.db_port) },
+          { name = "DB_NAME", value = var.product_db_name },
+          { name = "REDIS_HOST", value = var.redis_host },
+          { name = "REDIS_PORT", value = tostring(var.redis_port) },
+          { name = "CACHE_TTL_SECONDS", value = tostring(var.cache_ttl_seconds) },
+          { name = "CACHE_ENABLED", value = tostring(var.cache_enabled) },
+          { name = "DB_READ_HOST", value = coalesce(var.db_read_host, "") },
+          { name = "READ_REPLICA_ENABLED", value = tostring(var.read_replica_enabled && var.db_read_host != null && var.db_read_host != "") },
+        ],
+        local.reliability_env,
+      )
 
-      # Only the credentials come from Secrets Manager — host/port/dbname are not
-      # sensitive and are easier to read in the task definition / logs while debugging.
-      secrets = [
-        { name = "DB_USERNAME", valueFrom = "${var.rds_secret_arn}:username::" },
-        { name = "DB_PASSWORD", valueFrom = "${var.rds_secret_arn}:password::" },
-      ]
+      secrets = local.common_secrets
 
       logConfiguration = {
         logDriver = "awslogs"
         options = {
           "awslogs-group"         = var.log_group_name
           "awslogs-region"        = var.region
-          "awslogs-stream-prefix" = "app"
+          "awslogs-stream-prefix" = "product"
+        }
+      }
+    }
+  ])
+
+  tags = var.tags
+}
+
+resource "aws_ecs_service" "product" {
+  name            = "${var.name}-product"
+  cluster         = aws_ecs_cluster.this.id
+  task_definition = aws_ecs_task_definition.product.arn
+  desired_count   = var.desired_count
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = var.private_subnet_ids
+    security_groups  = [var.security_group_id]
+    assign_public_ip = false
+  }
+
+  load_balancer {
+    target_group_arn = var.product_target_group_arn
+    container_name   = "product"
+    container_port   = var.container_port
+  }
+
+  service_connect_configuration {
+    enabled   = true
+    namespace = aws_service_discovery_http_namespace.this.arn
+
+    service {
+      port_name      = "http"
+      discovery_name = "product"
+      client_alias {
+        port     = var.container_port
+        dns_name = "product"
+      }
+    }
+  }
+
+  lifecycle {
+    ignore_changes = [desired_count]
+  }
+
+  tags = merge(var.tags, { Name = "${var.name}-product" })
+}
+
+# ---------------------------------------------------------------------------
+# Payment (gateway sidecar stays here — only Payment talks to the fake GW)
+# ---------------------------------------------------------------------------
+
+resource "aws_ecs_task_definition" "payment" {
+  family                   = "${var.name}-payment"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = var.cpu
+  memory                   = var.memory
+  execution_role_arn       = var.execution_role_arn
+  task_role_arn            = var.task_role_arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "payment"
+      image     = var.image
+      essential = true
+      command   = ["uvicorn", "app.payment.main:app", "--host", "0.0.0.0", "--port", tostring(var.container_port)]
+
+      portMappings = [
+        {
+          containerPort = var.container_port
+          protocol      = "tcp"
+          name          = "http"
+          appProtocol   = "http"
+        }
+      ]
+
+      environment = concat(
+        [
+          { name = "SERVICE_NAME", value = "payment" },
+          { name = "APP_NAME", value = var.app_name },
+          { name = "ENVIRONMENT", value = var.environment },
+          { name = "DB_HOST", value = var.db_host },
+          { name = "DB_PORT", value = tostring(var.db_port) },
+          { name = "DB_NAME", value = var.payment_db_name },
+          { name = "READ_REPLICA_ENABLED", value = "false" },
+          { name = "PAYMENT_GATEWAY_URL", value = "http://localhost:${var.payment_gateway_port}" },
+        ],
+        local.reliability_env,
+      )
+
+      secrets = local.common_secrets
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = var.log_group_name
+          "awslogs-region"        = var.region
+          "awslogs-stream-prefix" = "payment"
         }
       }
     },
-    # V5 (Reliability): the stand-in third-party payment gateway
-    # (fake_gateway/), as a sidecar rather than its own service. A sidecar
-    # needs no service discovery, no load balancer, and no extra Fargate task
-    # — the app reaches it on localhost. Inventing internal service discovery
-    # for a fake dependency would be V7's (Microservices) work done early for
-    # no benefit; a real integration deletes this container and points
-    # PAYMENT_GATEWAY_URL at the provider's public endpoint.
-    #
-    # essential = false is the important part: if this stand-in crashes or is
-    # killed during a chaos experiment, ECS must NOT tear down the whole task.
-    # The app is supposed to survive its payment provider dying — that is the
-    # entire thesis of this version, and an essential sidecar would prove the
-    # opposite by taking the API down with it.
     {
       name      = "payment-gateway"
       image     = var.image
@@ -139,61 +235,155 @@ resource "aws_ecs_task_definition" "app" {
   tags = var.tags
 }
 
-resource "aws_ecs_service" "app" {
-  name            = "${var.name}-app"
+resource "aws_ecs_service" "payment" {
+  name            = "${var.name}-payment"
   cluster         = aws_ecs_cluster.this.id
-  task_definition = aws_ecs_task_definition.app.arn
-  desired_count   = var.desired_count
+  task_definition = aws_ecs_task_definition.payment.arn
+  desired_count   = var.payment_desired_count
   launch_type     = "FARGATE"
 
   network_configuration {
-    subnets         = var.private_subnet_ids
-    security_groups = [var.security_group_id]
-    # No public IP: tasks live in private subnets and reach the internet (e.g. ECR)
-    # via the NAT Gateway; inbound traffic only arrives via the ALB.
+    subnets          = var.private_subnet_ids
+    security_groups  = [var.security_group_id]
     assign_public_ip = false
   }
 
   load_balancer {
-    target_group_arn = var.target_group_arn
-    container_name   = "app"
+    target_group_arn = var.payment_target_group_arn
+    container_name   = "payment"
     container_port   = var.container_port
   }
 
-  # Note: the image tag is always "latest" (see var.image) and CI/CD redeploys via
-  # `aws ecs update-service --force-new-deployment` rather than registering a new
-  # task definition revision, so there is nothing for Terraform to fight over here.
-  # (Trade-off documented in ADR-002: no per-deploy task-def history/easy rollback,
-  # acceptable for a V1 learning project.)
+  service_connect_configuration {
+    enabled   = true
+    namespace = aws_service_discovery_http_namespace.this.arn
 
-  # V2: Application Auto Scaling (infra/modules/autoscaling) owns desired_count
-  # after the initial apply — it raises/lowers it directly via the ECS API in
-  # response to CPU/memory/request-count targets. Without ignore_changes here,
-  # the next `terraform apply` would see the drift between the static
-  # `var.desired_count` and whatever Auto Scaling set at runtime, and reset it
-  # back down, fighting the very thing this version is trying to build.
+    service {
+      port_name      = "http"
+      discovery_name = "payment"
+      client_alias {
+        port     = var.container_port
+        dns_name = "payment"
+      }
+    }
+  }
+
   lifecycle {
     ignore_changes = [desired_count]
   }
 
-  tags = merge(var.tags, { Name = "${var.name}-app" })
+  tags = merge(var.tags, { Name = "${var.name}-payment" })
 }
 
-### V4 (Asynchronous Processing): a second, separate ECS service running
-### app/worker.py — the order-events consumer. Same image as "app", but no
-### load_balancer block (it's not behind the ALB, doesn't accept inbound
-### traffic at all — see the worker security group). Scaled independently from
-### the API tier, driven by queue depth rather than CPU/memory/request count
-### (infra/modules/autoscaling).
-###
-### V5 (Reliability) added the RDS/Secrets Manager wiring V4 deliberately
-### omitted. The worker now writes the processed_events table
-### (app/core/idempotency.py): the durable record that a given side effect
-### already ran. Redis stays in front of it as a cache and an in-flight lease,
-### but it can't be the authority — a key that can be evicted or lost on
-### restart stops deduplicating under exactly the conditions (failover,
-### partition, restart) that cause redeliveries in the first place. Also gets
-### no payment-gateway sidecar: the worker's handlers never call it.
+# ---------------------------------------------------------------------------
+# Order (owns customers; calls product + payment via Service Connect DNS)
+# ---------------------------------------------------------------------------
+
+resource "aws_ecs_task_definition" "order" {
+  family                   = "${var.name}-order"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = var.cpu
+  memory                   = var.memory
+  execution_role_arn       = var.execution_role_arn
+  task_role_arn            = var.task_role_arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "order"
+      image     = var.image
+      essential = true
+      command   = ["uvicorn", "app.order.main:app", "--host", "0.0.0.0", "--port", tostring(var.container_port)]
+
+      portMappings = [
+        {
+          containerPort = var.container_port
+          protocol      = "tcp"
+          name          = "http"
+          appProtocol   = "http"
+        }
+      ]
+
+      environment = concat(
+        [
+          { name = "SERVICE_NAME", value = "order" },
+          { name = "APP_NAME", value = var.app_name },
+          { name = "ENVIRONMENT", value = var.environment },
+          { name = "DB_HOST", value = var.db_host },
+          { name = "DB_PORT", value = tostring(var.db_port) },
+          { name = "DB_NAME", value = var.order_db_name },
+          { name = "REDIS_HOST", value = var.redis_host },
+          { name = "REDIS_PORT", value = tostring(var.redis_port) },
+          { name = "AWS_REGION", value = var.region },
+          { name = "SQS_QUEUE_NAME", value = var.sqs_queue_name },
+          { name = "SQS_VISIBILITY_TIMEOUT_SECONDS", value = tostring(var.sqs_visibility_timeout_seconds) },
+          { name = "READ_REPLICA_ENABLED", value = "false" },
+          # Service Connect DNS names registered by the product/payment services.
+          { name = "PRODUCT_SERVICE_URL", value = "http://product:${var.container_port}" },
+          { name = "PAYMENT_SERVICE_URL", value = "http://payment:${var.container_port}" },
+        ],
+        local.reliability_env,
+      )
+
+      secrets = local.common_secrets
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = var.log_group_name
+          "awslogs-region"        = var.region
+          "awslogs-stream-prefix" = "order"
+        }
+      }
+    }
+  ])
+
+  tags = var.tags
+}
+
+resource "aws_ecs_service" "order" {
+  name            = "${var.name}-order"
+  cluster         = aws_ecs_cluster.this.id
+  task_definition = aws_ecs_task_definition.order.arn
+  desired_count   = var.desired_count
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = var.private_subnet_ids
+    security_groups  = [var.security_group_id]
+    assign_public_ip = false
+  }
+
+  load_balancer {
+    target_group_arn = var.order_target_group_arn
+    container_name   = "order"
+    container_port   = var.container_port
+  }
+
+  service_connect_configuration {
+    enabled   = true
+    namespace = aws_service_discovery_http_namespace.this.arn
+
+    service {
+      port_name      = "http"
+      discovery_name = "order"
+      client_alias {
+        port     = var.container_port
+        dns_name = "order"
+      }
+    }
+  }
+
+  lifecycle {
+    ignore_changes = [desired_count]
+  }
+
+  tags = merge(var.tags, { Name = "${var.name}-order" })
+}
+
+# ---------------------------------------------------------------------------
+# Worker (Order DB + SQS)
+# ---------------------------------------------------------------------------
 
 resource "aws_ecs_task_definition" "worker" {
   family                   = "${var.name}-worker"
@@ -212,6 +402,7 @@ resource "aws_ecs_task_definition" "worker" {
       command   = ["python", "-m", "app.worker"]
 
       environment = [
+        { name = "SERVICE_NAME", value = "worker" },
         { name = "APP_NAME", value = var.app_name },
         { name = "ENVIRONMENT", value = var.environment },
         { name = "REDIS_HOST", value = var.redis_host },
@@ -220,25 +411,18 @@ resource "aws_ecs_task_definition" "worker" {
         { name = "SQS_QUEUE_NAME", value = var.sqs_queue_name },
         { name = "SQS_DLQ_NAME", value = var.sqs_dlq_name },
         { name = "SQS_VISIBILITY_TIMEOUT_SECONDS", value = tostring(var.sqs_visibility_timeout_seconds) },
-        # V5: the worker's own DB access, for processed_events.
         { name = "DB_HOST", value = var.db_host },
         { name = "DB_PORT", value = tostring(var.db_port) },
-        { name = "DB_NAME", value = var.db_name },
+        { name = "DB_NAME", value = var.order_db_name },
         { name = "DB_CONNECT_TIMEOUT_SECONDS", value = tostring(var.db_connect_timeout_seconds) },
         { name = "DB_STATEMENT_TIMEOUT_SECONDS", value = tostring(var.db_statement_timeout_seconds) },
         { name = "WORKER_HANDLER_RETRY_ATTEMPTS", value = tostring(var.worker_handler_retry_attempts) },
         { name = "IDEMPOTENCY_LEASE_TTL_SECONDS", value = tostring(var.sqs_visibility_timeout_seconds) },
-        # V6: the worker writes processed_events and must never use the
-        # asynchronous replica. Explicit false so a shared task-def template
-        # can't accidentally route it there.
         { name = "READ_REPLICA_ENABLED", value = "false" },
         { name = "DB_POOL_RECYCLE_SECONDS", value = tostring(var.db_pool_recycle_seconds) },
       ]
 
-      secrets = [
-        { name = "DB_USERNAME", valueFrom = "${var.rds_secret_arn}:username::" },
-        { name = "DB_PASSWORD", valueFrom = "${var.rds_secret_arn}:password::" },
-      ]
+      secrets = local.common_secrets
 
       logConfiguration = {
         logDriver = "awslogs"
@@ -267,10 +451,6 @@ resource "aws_ecs_service" "worker" {
     assign_public_ip = false
   }
 
-  # V4: infra/modules/autoscaling's step-scaling policies (driven by SQS
-  # queue-depth CloudWatch alarms, not CPU/memory/ALB) own desired_count
-  # after the initial apply — same drift-avoidance reasoning as the app
-  # service above.
   lifecycle {
     ignore_changes = [desired_count]
   }

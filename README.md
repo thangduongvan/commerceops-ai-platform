@@ -9,6 +9,7 @@ The [CommerceOps AI Platform learning project](../Solution%20Architect%20Learnin
 * **V4 — Asynchronous Processing**: order creation publishes events to an SQS queue instead of calling Notification/Analytics/Email/Search indexing in-process; a separate worker service consumes them off the request path. See [Asynchronous Processing (V4)](#asynchronous-processing-v4) below.
 * **V5 — Reliability**: timeouts on every external call, retry with jittered exponential backoff, a circuit breaker and bulkhead around the payment gateway, and durable per-handler idempotency — so a failing dependency degrades one feature instead of taking the platform down. See [Reliability (V5)](#reliability-v5) below.
 * **V6 — Database High Availability**: RDS Multi-AZ (RPO ≈ 0, automatic failover), automated backups/PITR, an asynchronous read replica for product reads, and local streaming replication so lag/RPO/failover are learnable without an AWS bill. See [Database High Availability (V6)](#database-high-availability-v6) below.
+* **V7 — Microservices**: Product / Order / Payment as separate processes with database-per-service, sync HTTP between them, nginx/ALB path routing, and ECS Service Connect for discovery. See [Microservices (V7)](#microservices-v7) below.
 
 ## V0: Local architecture
 
@@ -32,69 +33,46 @@ One deployable process, one database. Each domain is a self-contained package (`
 
 ```
 app/
-├── main.py                 # FastAPI app, routers, /health + V5 /health/ready
-├── worker.py                # V4: order-events consumer process (python -m app.worker)
-├── dlq.py                    # V5: DLQ inspect/redrive/purge CLI (python -m app.dlq)
+├── main.py                 # thin re-export of Order app (prefer per-service mains)
+├── product/main.py         # V7: Product service entrypoint
+├── order/main.py           # V7: Order (+ Customer) service entrypoint
+├── payment/main.py         # V7: Payment service entrypoint
+├── worker.py               # V4: order-events consumer (Order DB)
+├── dlq.py                  # V5: DLQ CLI
+├── clients/                # V7: product_client + payment_client (Order → peers)
 ├── core/
-│   ├── config.py           # environment-driven settings
-│   ├── database.py         # SQLAlchemy engine/session, Base, get_db;
-│   │                       # V6: get_read_db, pool_recycle, replica lag probe
-│   ├── cache.py            # V3: Redis cache-aside helpers
-│   ├── queue.py             # V4: SQS producer (publish_event)
-│   ├── reliability.py        # V5: retry/backoff, circuit breaker, bulkhead
-│   ├── idempotency.py         # V5: Redis lease + Postgres-authoritative dedup
-│   └── models.py               # V5: processed_events table
-├── customer/                # create, get
-├── product/                  # create, get, list, update
-├── order/                     # create, get, list, cancel (+ transaction logic)
-├── payment/                    # V5: HTTP client for the payment gateway
-├── notification/                # V0: logs-only notification channel; V4: + email
-├── analytics/                     # V4: logs-only analytics sink
-└── search/                         # V4: logs-only search-indexing sink
+│   ├── config.py
+│   ├── database.py         # V6 read replica helpers
+│   ├── ensure_database.py  # V7: CREATE DATABASE if missing (logical DBs on RDS)
+│   ├── service_app.py      # V7: shared lifespan/health helpers
+│   ├── cache.py / queue.py / reliability.py / idempotency.py / models.py
+├── customer/ product/ order/ payment/ notification/ analytics/ search/
 
-fake_gateway/                   # V5: stand-in third-party payment gateway (its own
-                                #     process, with runtime fault injection)
+fake_gateway/                   # V5 payment stand-in (Payment task sidecar in AWS)
 
 tests/
-├── unit/          # pure logic, no DB (reliability primitives, gateway client via
-│                  # httpx.MockTransport, idempotency, queue/worker/DLQ via moto)
-└── integration/   # FastAPI TestClient against an in-memory SQLite DB
+├── unit/
+└── integration/   # gateway-style composite client + per-service TestClients
 
 docs/
-├── api.md                          # endpoint reference
-├── database_schema.md              # ER diagram
-├── deployment.md                   # V1: AWS deployment; V2: load test; V3: caching
-│                                   # experiment; V4: backpressure; V5: fault injection;
-│                                   # V6: Multi-AZ / failover / PITR drills
+├── api.md / database_schema.md / deployment.md
 └── adr/
-    ├── ADR-001-modular-monolith.md
-    ├── ADR-002-aws-foundation.md
-    ├── ADR-003-horizontal-scaling.md
-    ├── ADR-004-caching.md
-    ├── ADR-005-async-processing.md
-    ├── ADR-006-reliability.md
-    └── ADR-007-database-ha.md
+    ├── ADR-001 … ADR-007
+    └── ADR-008-microservices.md
 
-infra/                             # V1-V6: Terraform (see "Deploying to AWS" below)
-├── bootstrap/                      # one-time: remote state S3 bucket + DynamoDB lock table
-├── modules/                        # vpc, security_groups, ecr, s3, iam, rds, elasticache, sqs, alb, ecs, autoscaling, cloudwatch
-├── environments/dev/               # wires the modules together for the dev environment
-├── localstack/                     # V4: LocalStack init script (creates the local order-events queue + DLQ)
-└── postgres/                       # V6: primary init + standby entrypoint for Compose streaming replication
+infra/
+├── modules/ … alb (path rules), ecs (3 services + Service Connect), …
+├── nginx/gateway.conf          # V7: local path-based gateway
+└── postgres/product/           # V6/V7: product primary replication scripts
 
-loadtest/                          # V2: Locust; V4: backpressure; V5: chaos; V6: HA drills
-├── locustfile.py
-├── queue_experiment.py             # V4: produce/consume/depth against SQS or LocalStack
-├── chaos_experiment.py             # V5: payment timeout / 50% failure / crash / duplicate
-├── ha_experiment.py                # V6: lag / promote-local / failover-aws / restore-pitr
-└── requirements.txt
-
-.github/workflows/deploy.yml        # V1: build/push to ECR + redeploy ECS on push to main
+loadtest/
+├── locustfile.py / queue_experiment.py / chaos_experiment.py / ha_experiment.py
+└── microservices_experiment.py # V7: fault-isolation / latency / checklist
 ```
 
 ## Tech stack
 
-Python 3.11+, FastAPI, SQLAlchemy 2.0, PostgreSQL 16, Redis 7 (V3 caching), boto3 + Amazon SQS / LocalStack (V4 async processing), httpx (V5 payment gateway client), Docker / Docker Compose, pytest + moto (V4 SQS mocking) + httpx.MockTransport (V5), Locust (V2 load testing).
+Python 3.11+, FastAPI, SQLAlchemy 2.0, PostgreSQL 16 (per service), Redis 7, boto3 + SQS / LocalStack, httpx, Docker Compose, nginx (edge gateway), pytest + moto, Locust, Terraform → ECS/Fargate + ALB path routing + Service Connect + RDS (3 logical DBs).
 
 ## Running with Docker Compose (recommended)
 
@@ -102,10 +80,10 @@ Python 3.11+, FastAPI, SQLAlchemy 2.0, PostgreSQL 16, Redis 7 (V3 caching), boto
 docker compose up --build
 ```
 
-* App: http://localhost:8000 (Swagger UI at `/docs`, health check at `/health`, dependency probe at `/health/ready`)
-* Postgres primary: `localhost:5432` (user/password/db: `commerceops`)
-* Postgres replica (V6 hot standby): `localhost:5433`
-* Payment gateway (V5 stand-in): http://localhost:9000 — fault injection via `POST /admin/chaos`
+* Gateway (clients): http://localhost:8000 — routes `/products`, `/orders`, `/customers`, `/payments`
+* Direct services (debug): Product `:8001`, Order `:8002`, Payment `:8003`
+* Product DB `:5432` / replica `:5433`; Order DB `:5434`; Payment DB `:5435`
+* Payment gateway: http://localhost:9000
 
 ## Running locally without Docker
 
@@ -329,6 +307,30 @@ The load-bearing lesson is `HA ≠ Backup ≠ Read Replica ≠ DR`:
 * **Drills**: [loadtest/ha_experiment.py](loadtest/ha_experiment.py) — `lag`, `promote-local` (RPO), `failover-aws` (RTO via `reboot-db-instance --force-failover`), `restore-pitr` (why backups ≠ HA). See [docs/deployment.md](docs/deployment.md#10-v6-database-high-availability).
 * **Why Multi-AZ instance (not cluster/Aurora), why only product reads use the replica, why teardown is now two steps**: [ADR-007](docs/adr/ADR-007-database-ha.md).
 
+## Microservices (V7)
+
+New requirement: separate teams own Product, Order, and Payment, with different workload shapes. The modular monolith's in-process coupling and shared schema become the bottleneck — see [ADR-008](docs/adr/ADR-008-microservices.md).
+
+```mermaid
+flowchart TB
+    Client --> Gateway[nginx / ALB]
+    Gateway -->|/products| Product
+    Gateway -->|/orders /customers| Order
+    Gateway -->|/payments| Payment
+    Order -->|HTTP reserve/release| Product
+    Order -->|HTTP charge| Payment
+    Product --> ProductDB[(product DB)]
+    Order --> OrderDB[(order DB)]
+    Payment --> PaymentDB[(payment DB)]
+```
+
+* **Three services** — `app.product.main`, `app.order.main` (owns Customer + worker), `app.payment.main` (owns `payments` table + gateway sidecar).
+* **Database-per-service** — no cross-DB FKs; stock via Product `POST /internal/stock/reserve|release`; Order copies `unit_price` from the reserve response.
+* **Sync HTTP** for the order path (Saga/outbox stay V11–V12). V5 reliability wraps the new hops in [`app/clients/`](app/clients/).
+* **Edge + discovery** — nginx gateway locally ([infra/nginx/gateway.conf](infra/nginx/gateway.conf)); ALB path rules + ECS Service Connect in AWS.
+* **AWS DBs** — three logical databases on one RDS instance (cost); `ensure_database` creates them at task startup.
+* **Experiment**: `python loadtest/microservices_experiment.py fault-isolation` — stop Product, Payment stays up, orders fail then recover. See [docs/deployment.md](docs/deployment.md#11-v7-microservices).
+
 ## Roadmap
 
 * [x] V0 — Local Modular Monolith
@@ -338,6 +340,7 @@ The load-bearing lesson is `HA ≠ Backup ≠ Read Replica ≠ DR`:
 * [x] V4 — Asynchronous Processing (SQS)
 * [x] V5 — Reliability (timeouts, retry/backoff, circuit breaker, bulkhead, idempotency)
 * [x] V6 — Database High Availability (Multi-AZ, backups/PITR, read replica)
-* [ ] V7+ — Microservices, Event-Driven Architecture, Kafka, CQRS, Outbox, Saga, AI Operations Agent, Observability, Security, Disaster Recovery, Cost Optimization
+* [x] V7 — Microservices (Product / Order / Payment, database-per-service)
+* [ ] V8+ — Event-Driven Architecture, Kafka, CQRS, Outbox, Saga, AI Operations Agent, Observability, Security, Disaster Recovery, Cost Optimization
 
 Per the [learning project plan](../Solution%20Architect%20Learning%20Project.md).

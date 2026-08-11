@@ -18,7 +18,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.core import config as config_module
 from app.core.database import Base, get_read_db
-from app.main import app
+from app.product.main import app as product_app
 from app.product.models import Product
 
 
@@ -28,7 +28,7 @@ def stale_replica(client):
     still has the *old* product name — simulating replica lag."""
     previous_cache = config_module.settings.cache_enabled
     config_module.settings.cache_enabled = False
-    previous_override = app.dependency_overrides.get(get_read_db)
+    previous_override = product_app.dependency_overrides.get(get_read_db)
 
     created = client.post(
         "/products",
@@ -65,16 +65,16 @@ def stale_replica(client):
         finally:
             db.close()
 
-    app.dependency_overrides[get_read_db] = _override_read
+    product_app.dependency_overrides[get_read_db] = _override_read
 
     try:
         yield product_id
     finally:
         config_module.settings.cache_enabled = previous_cache
         if previous_override is not None:
-            app.dependency_overrides[get_read_db] = previous_override
+            product_app.dependency_overrides[get_read_db] = previous_override
         else:
-            app.dependency_overrides.pop(get_read_db, None)
+            product_app.dependency_overrides.pop(get_read_db, None)
         replica_engine.dispose()
 
 

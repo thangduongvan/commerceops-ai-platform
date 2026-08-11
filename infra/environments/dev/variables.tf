@@ -46,8 +46,29 @@ variable "db_port" {
 }
 
 variable "db_name" {
+  description = "Bootstrap RDS database created with the instance. V7 services create their own logical DBs at startup."
+  type        = string
+  default     = "commerceops"
+}
+
+variable "product_db_name" {
   type    = string
-  default = "commerceops"
+  default = "commerceops_product"
+}
+
+variable "order_db_name" {
+  type    = string
+  default = "commerceops_order"
+}
+
+variable "payment_db_name" {
+  type    = string
+  default = "commerceops_payment"
+}
+
+variable "payment_desired_count" {
+  type    = number
+  default = 1
 }
 
 variable "db_username" {

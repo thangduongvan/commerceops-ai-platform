@@ -27,7 +27,7 @@ resource "aws_security_group" "alb" {
 
 resource "aws_security_group" "ecs" {
   name        = "${var.name}-ecs-sg"
-  description = "Allow inbound app traffic from the ALB only"
+  description = "Allow inbound app traffic from the ALB and east-west Service Connect"
   vpc_id      = var.vpc_id
 
   ingress {
@@ -36,6 +36,15 @@ resource "aws_security_group" "ecs" {
     to_port         = var.container_port
     protocol        = "tcp"
     security_groups = [aws_security_group.alb.id]
+  }
+
+  # V7: Order → Product / Payment over ECS Service Connect (same SG).
+  ingress {
+    description = "East-west Service Connect between microservices"
+    from_port   = var.container_port
+    to_port     = var.container_port
+    protocol    = "tcp"
+    self        = true
   }
 
   egress {

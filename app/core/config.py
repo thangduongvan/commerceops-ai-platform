@@ -25,6 +25,21 @@ class Settings(BaseSettings):
     app_name: str = "CommerceOps AI Platform"
     environment: str = "local"
 
+    # V7 (Microservices): which deployable this process is. Used in
+    # /health/ready and logging; Compose/ECS set it per service.
+    service_name: str = "monolith"
+
+    # Sync HTTP peers for the Order service. Compose DNS locally;
+    # ECS Service Connect hostnames in AWS. See docs/adr/ADR-008-microservices.md.
+    product_service_url: str = "http://product:8000"
+    payment_service_url: str = "http://payment:8000"
+
+    product_connect_timeout_seconds: float = 1.0
+    product_read_timeout_seconds: float = 2.0
+    product_retry_attempts: int = 3
+    product_bulkhead_max_concurrency: int = 20
+    product_bulkhead_acquire_timeout_seconds: float = 0.5
+
     db_host: Optional[str] = None
     db_port: int = 5432
     db_name: Optional[str] = None

@@ -2,13 +2,13 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.clients import payment_client, product_client
+from app.clients.product_client import ProductServiceError, ProductServiceUnavailable
 from app.core.queue import publish_event
 from app.customer.models import Customer
 from app.order.models import Order, OrderItem, OrderStatus
 from app.order.schemas import OrderCreate
-from app.payment import service as payment_service
 from app.payment.schemas import PaymentRequest
-from app.product.models import Product
 
 
 def _line_total(unit_price: float, quantity: int) -> float:
@@ -24,45 +24,42 @@ def _get_customer_or_404(db: Session, customer_id: int) -> Customer:
     return customer
 
 
-def _restock(db: Session, order: Order) -> None:
-    for item in order.items:
-        product = db.get(Product, item.product_id)
-        if product is not None:
-            product.stock_quantity += item.quantity
+def _release_items(order: Order) -> None:
+    """Compensating stock release via the Product service (V7)."""
+    items = [
+        {"product_id": item.product_id, "quantity": item.quantity} for item in order.items
+    ]
+    if items:
+        product_client.release(items)
 
 
 def create_order(db: Session, payload: OrderCreate) -> Order:
     _get_customer_or_404(db, payload.customer_id)
 
-    products: dict[int, Product] = {}
-    for item in payload.items:
-        product = db.get(Product, item.product_id)
-        if product is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Product {item.product_id} not found",
-            )
-        if product.stock_quantity < item.quantity:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Insufficient stock for product {item.product_id}",
-            )
-        products[item.product_id] = product
+    reserve_payload = [
+        {"product_id": item.product_id, "quantity": item.quantity} for item in payload.items
+    ]
+    try:
+        reserved = product_client.reserve(reserve_payload)
+    except ProductServiceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except ProductServiceUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Product service unavailable: {exc}",
+        ) from exc
 
-    # Order + items + stock decrement must succeed or fail together, so
-    # we never end up with a persisted order that doesn't match reserved
-    # stock (ACID transaction boundary).
+    # Order + items in the Order DB only. Stock already reserved in Product DB —
+    # the single-ACID boundary of the monolith is gone (see ADR-008).
     order = Order(customer_id=payload.customer_id, status=OrderStatus.PENDING.value)
     total = 0.0
-    for item in payload.items:
-        product = products[item.product_id]
-        product.stock_quantity -= item.quantity
-        total += _line_total(product.price, item.quantity)
+    for line in reserved:
+        total += _line_total(line["unit_price"], line["quantity"])
         order.items.append(
             OrderItem(
-                product_id=product.id,
-                quantity=item.quantity,
-                unit_price=product.price,
+                product_id=line["product_id"],
+                quantity=line["quantity"],
+                unit_price=line["unit_price"],
             )
         )
     order.total_amount = total
@@ -71,15 +68,16 @@ def create_order(db: Session, payload: OrderCreate) -> Order:
     db.commit()
     db.refresh(order)
 
-    # V4 (Asynchronous Processing): publish, don't call notification/analytics/
-    # email/search in-process. app/worker.py fans this one event out to all
-    # four side effects off the request path — see docs/adr/ADR-005-async-processing.md.
     publish_event(
         "OrderCreated",
-        {"order_id": order.id, "customer_id": order.customer_id, "total_amount": order.total_amount},
+        {
+            "order_id": order.id,
+            "customer_id": order.customer_id,
+            "total_amount": order.total_amount,
+        },
     )
 
-    payment_result = payment_service.charge(
+    payment_result = payment_client.charge(
         PaymentRequest(order_id=order.id, amount=order.total_amount)
     )
 
@@ -90,27 +88,18 @@ def create_order(db: Session, payload: OrderCreate) -> Order:
             {"order_id": order.id, "transaction_id": payment_result.transaction_id},
         )
     elif payment_result.status == "UNKNOWN":
-        # V5 (Reliability): the gateway never answered (timeout, retries
-        # exhausted, open circuit, shed by the bulkhead), so the charge may
-        # well have gone through.
-        #
-        # Deliberately NOT restocking here, unlike the declined branch below.
-        # Releasing stock for an order the customer may have paid for is the
-        # worse of the two errors: it can oversell inventory and leaves a
-        # paid order with nothing reserved for it. Holding stock on an
-        # unresolved order costs us availability of that stock until
-        # reconciliation resolves it — recoverable, and visible.
+        # Deliberately NOT releasing stock — same V5 rationale.
         order.status = OrderStatus.PAYMENT_PENDING.value
         publish_event(
             "OrderPaymentUnconfirmed",
             {"order_id": order.id, "reason": payment_result.reason},
         )
     else:
-        # Compensating action: release the stock reserved above, since the
-        # order definitively did not complete — the gateway answered and
-        # declined. This is a small preview of the Saga/compensation pattern
-        # introduced properly at V12.
-        _restock(db, order)
+        try:
+            _release_items(order)
+        except ProductServiceUnavailable:
+            # Stock may remain reserved; reconciliation is V12's job.
+            pass
         order.status = OrderStatus.PAYMENT_FAILED.value
         publish_event("OrderPaymentFailed", {"order_id": order.id})
 
@@ -137,10 +126,6 @@ def list_orders(
 
 def cancel_order(db: Session, order_id: int) -> Order:
     order = get_order(db, order_id)
-    # V5: PAYMENT_PENDING is not cancellable either. Cancelling restocks, and
-    # restocking an order that may have been charged is precisely what the
-    # UNKNOWN branch of create_order refuses to do. It has to be reconciled
-    # against the gateway into PAID or PAYMENT_FAILED first.
     if order.status in (
         OrderStatus.CANCELLED.value,
         OrderStatus.PAYMENT_FAILED.value,
@@ -151,7 +136,16 @@ def cancel_order(db: Session, order_id: int) -> Order:
             detail=f"Order cannot be cancelled from status {order.status}",
         )
 
-    _restock(db, order)
+    try:
+        _release_items(order)
+    except ProductServiceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except ProductServiceUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Product service unavailable: {exc}",
+        ) from exc
+
     order.status = OrderStatus.CANCELLED.value
     db.commit()
     db.refresh(order)
